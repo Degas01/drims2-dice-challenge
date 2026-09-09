@@ -257,26 +257,57 @@ laptop in under two minutes.
 
 ## Running it
 
-Inside the DRIMS2 container, with this repository cloned into `drims_ws/src`:
+Clone this repository into `DRIMS2-2026/drims_ws/src`, then, **on the host**,
+give the container write access to the workspace (this is what `setup.sh` in the
+DRIMS2 repo does; it must be run *after* the files are in place):
 
 ```bash
-cd ~/DRIMS2-2026 && ./start.sh <YOUR-DOMAIN-ID>
-cd ~/drims_ws && colcon build --symlink-install && source install/setup.bash
+cd ~/DRIMS2-2026
+./setup.sh
+sudo chgrp -R 42042 drims_ws bags && sudo chmod -R g+rwX drims_ws bags
+./start.sh <YOUR-DOMAIN-ID>
 ```
 
-**Terminal 1 — the cell** (pick the cell number that matches your setup):
+Inside the container:
+
+```bash
+cd ~/drims_ws && colcon build --symlink-install && source install/setup.bash
+ros2 pkg list | grep dice        # expect dice_task and dice_vision
+```
+
+> **Every new container shell needs `source ~/drims_ws/install/setup.bash`.**
+> The DRIMS2 image adds that line to `/root/.bashrc` rather than to the `drims`
+> user's, so it is never picked up automatically. Without it `ros2 launch
+> dice_task ...` reports "package not found" even though the build succeeded.
+
+Each terminal below is a separate `./connect.sh` from the host, followed by that
+`source` line.
+
+**Terminal 1 — the cell** (use the number of the cell you are on):
 
 ```bash
 ros2 launch drims_description ur5e_1_start.launch.py fake:=true
 ```
 
-**Terminal 2 — the die.** `surface_height` is per cell: `-0.04`, `-0.02`,
-`-0.01`, `-0.02` for cells 1–4.
+**Terminal 2 — the die.** `selected_cell` must match the cell you launched: it
+sets both the spawn bounds and the surface height, and it *overrides* any
+`surface_height:=` you pass, so there is no point setting that by hand.
+
+| cell | x range | y range | surface_height |
+| --- | --- | --- | --- |
+| 1 | −0.35 … 0.15 | 0.50 … 0.85 | −0.04 |
+| 2 | −0.30 … 0.20 | 0.50 … 0.85 | −0.02 |
+| 3 | −0.28 … 0.22 | 0.35 … 0.70 | −0.01 |
+| 4 | −0.30 … 0.20 | 0.50 … 0.85 | −0.02 |
 
 ```bash
 ros2 launch drims_dice_simulator spawn_dice.launch.py \
-    face_up:=5 position:="[0.6, 0.2, 0.0]" surface_height:=-0.04
+    selected_cell:=1 face_up:=5 position:="[-0.1, 0.65, -0.04]"
 ```
+
+A position outside the selected cell's range kills the spawner immediately with
+`Specified position [...] is outside the bounds`. The Z value is forgiving — it
+is raised automatically to sit the die on the surface.
 
 **Terminal 3 — the challenge:**
 
@@ -302,7 +333,7 @@ The point of the challenge is that it works from *any* start, not one:
 # every starting face, for a fixed target
 for f in 1 2 3 4 5 6; do
   ros2 service call /reset_dice std_srvs/srv/Trigger "{}"
-  ros2 launch drims_dice_simulator spawn_dice.launch.py face_up:=$f
+  ros2 launch drims_dice_simulator spawn_dice.launch.py selected_cell:=1 face_up:=$f
   ros2 launch dice_task dice_challenge.launch.py target_face:=4
 done
 
@@ -310,7 +341,8 @@ done
 ros2 launch dice_task dice_challenge.launch.py target_face:=6 strategy:=blind
 
 # random position and face
-ros2 launch drims_dice_simulator spawn_dice.launch.py random_position:=true face_up:=0
+ros2 launch drims_dice_simulator spawn_dice.launch.py \
+    selected_cell:=1 random_position:=true face_up:=0
 ```
 
 ### Running the vision on the recorded bags
@@ -345,6 +377,18 @@ ros2 launch dice_task dice_challenge.launch.py \
 | `dice_vision/chroma_tolerance` | `0.055` | Raise if the die is being cut into pieces; lower if shadow leaks in. |
 
 ---
+
+## Troubleshooting
+
+Integration problems hit while bringing this up on WSL2, and what they look like:
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `colcon build` → `PermissionError: [Errno 13] ... 'log'` | `drims_ws` is bind-mounted from the host and owned by your host user; the container runs as `drims` (uid 1001, group `drims2` gid 42042). | Run `setup.sh` on the host, then `sudo chgrp -R 42042 drims_ws bags && sudo chmod -R g+rwX drims_ws bags`. |
+| Build succeeds, but `ros2 launch dice_task ...` says package not found | The image writes the `drims_ws` source line into `/root/.bashrc`, not the `drims` user's. | `source ~/drims_ws/install/setup.bash` in every container shell. |
+| `Package 'drims_dice_simulator' not found`, search path is only `/opt/ros/humble` | You are on the WSL host, not in the container. | Prompt should read `drims@`, not `giacomo@`. `./connect.sh` first. |
+| Spawner exits with `position ... outside the bounds` | The spawn position must lie inside the selected cell's range. | Set `selected_cell` to match your cell and pick x/y from the table above. |
+| RViz shows the cell but no die | The spawner died — check terminal 2, not RViz. | As above. |
 
 ## Known limits
 

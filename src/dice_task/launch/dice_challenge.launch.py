@@ -27,7 +27,24 @@ def generate_launch_description():
                 "blind: camera only, as on the real cell."
             ),
         ),
-        DeclareLaunchArgument("dice_size_m", default_value="0.027"),
+        DeclareLaunchArgument("dice_size_m", default_value="0.03"),
+        DeclareLaunchArgument(
+            "motion_mode",
+            default_value="moveit",
+            description=(
+                "moveit: one move_to_pose per waypoint, each planned to a full "
+                "stop, every motion collision-checked. trajectory: generate the "
+                "Cartesian path here, blend the corners and send one timed "
+                "JointTrajectory -- faster, but it bypasses MoveIt's "
+                "planning-scene checks."
+            ),
+        ),
+        DeclareLaunchArgument(
+            "blend_radius_m",
+            default_value="0.03",
+            description="Corner rounding for motion_mode:=trajectory. 0 disables it.",
+        ),
+        DeclareLaunchArgument("max_regrasps", default_value="8"),
         DeclareLaunchArgument("velocity_scaling", default_value="0.3"),
         DeclareLaunchArgument(
             "identification_service",
@@ -57,6 +74,9 @@ def generate_launch_description():
                 "target_face": LaunchConfiguration("target_face"),
                 "strategy": LaunchConfiguration("strategy"),
                 "dice_size_m": LaunchConfiguration("dice_size_m"),
+                "motion_mode": LaunchConfiguration("motion_mode"),
+                "blend_radius_m": LaunchConfiguration("blend_radius_m"),
+                "max_regrasps": LaunchConfiguration("max_regrasps"),
                 "velocity_scaling": LaunchConfiguration("velocity_scaling"),
                 "identification_service": LaunchConfiguration("identification_service"),
             },

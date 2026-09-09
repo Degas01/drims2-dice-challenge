@@ -114,7 +114,20 @@ class VisionClient(Node):
         rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
         result = future.result()
         if result is None:
+            self.get_logger().error(
+                f"{self._service_name} did not answer within {timeout:.0f} s. "
+                "The service exists, so whatever provides it is stuck rather than "
+                "absent -- check that node's own log."
+            )
             return 0, None, False
+        if not result.success:
+            self.get_logger().error(
+                f"{self._service_name} answered but reported failure "
+                f"(face_number={result.face_number}). For the dice simulator this "
+                "usually means it could not resolve the die in the planning scene: "
+                "try `ros2 service call /reset_dice std_srvs/srv/Trigger \"{}\"` "
+                "and check the spawner's terminal."
+            )
         return int(result.face_number), result.pose, bool(result.success)
 
 

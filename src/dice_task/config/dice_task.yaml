@@ -1,0 +1,29 @@
+# Parameters for the dice_task state machine.
+dice_task:
+  ros__parameters:
+    target_face: 1
+    strategy: auto          # auto | exact | blind
+
+    base_frame: base_link
+    die_frame: dice_tf      # published by drims_dice_simulator
+    tool_frame: tool0
+    tip_frame: tip
+    identification_service: dice_identification
+
+    # UR5e home pose used by the DRIMS demo node.
+    home_joints: [0.0, -1.97, 2.13, -1.83, -1.50, 0.0]
+
+    gripper_open: 0.045
+    gripper_closed: 0.0
+    gripper_effort: 5.0
+    gripper_close_axis: y   # which tool axis the fingers close along
+
+    dice_size_m: 0.027
+    approach_height_m: 0.10
+    lift_height_m: 0.12
+    place_clearance_m: 0.004
+    velocity_scaling: 0.3
+    approach_velocity_scaling: 0.15
+    max_regrasps: 8
+    settle_seconds: 0.7
+    attached_object_id: dice

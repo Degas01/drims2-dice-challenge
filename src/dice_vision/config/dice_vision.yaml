@@ -1,0 +1,29 @@
+# Parameters for the dice_vision node.
+#
+# The board geometry defaults come from the DRIMS vision hands-on: the green
+# board is roughly 700 x 500 mm with (0, 0) at its centre.  board_origin_in_base
+# is where that centre sits in the robot base frame; its Z is the same
+# surface_height that drims_dice_simulator uses, which the hands-on lists per
+# cell as: cell 1 = -0.04, cell 2 = -0.02, cell 3 = -0.01, cell 4 = -0.02.
+dice_vision:
+  ros__parameters:
+    compressed: true
+    base_frame: base_link
+    publish_tf: false
+    die_frame: dice_vision_tf
+    publish_mask: false
+
+    board_size_m: [0.70, 0.50]
+    board_origin_in_base: [0.60, 0.10, -0.01]
+    board_yaw_in_base: 0.0
+    camera_height_m: 1.0
+    dice_size_m: 0.027
+    recalibrate_every_frame: false
+
+    # Only used to find the board on the first frame; after that the board's own
+    # measured chromaticity does the classifying, so a green die is still found.
+    board_hue_min: 30
+    board_hue_max: 95
+    chroma_tolerance: 0.055
+
+    min_face_confidence: 0.25

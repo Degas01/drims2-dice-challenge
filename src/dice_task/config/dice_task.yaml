@@ -16,7 +16,10 @@ dice_task:
     gripper_open: 0.045
     gripper_closed: 0.0
     gripper_effort: 5.0
-    gripper_close_axis: y   # which tool axis the fingers close along
+    # NOTE the quotes. In YAML 1.1 a bare y/n/yes/no/on/off is a *boolean*, so
+    # `gripper_close_axis: y` arrives as True and ROS rejects it as the wrong
+    # parameter type. Always quote single-letter axis names.
+    gripper_close_axis: "y"   # which tool axis the fingers close along
 
     dice_size_m: 0.027
     approach_height_m: 0.10

@@ -38,6 +38,7 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
 from moveit_msgs.msg import MoveItErrorCodes
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.node import Node
 from tf2_ros import Buffer, TransformListener
 
@@ -127,7 +128,18 @@ class DiceTaskNode(Node):
         self.declare_parameter("gripper_open", 0.045)
         self.declare_parameter("gripper_closed", 0.0)
         self.declare_parameter("gripper_effort", 5.0)
-        self.declare_parameter("gripper_close_axis", "y")
+        # Declared with dynamic typing on purpose: YAML 1.1 turns a bare `y`
+        # into the boolean True, and a statically typed string parameter would
+        # then abort the node inside rclpy with a type error that says nothing
+        # about YAML. Accept whatever arrives and normalise it below.
+        self.declare_parameter(
+            "gripper_close_axis",
+            "y",
+            ParameterDescriptor(
+                dynamic_typing=True,
+                description="Tool axis the gripper fingers close along: 'x' or 'y'.",
+            ),
+        )
 
         self.declare_parameter("dice_size_m", 0.027)
         self.declare_parameter("approach_height_m", 0.10)
@@ -148,6 +160,31 @@ class DiceTaskNode(Node):
 
     def p(self, name: str):
         return self.get_parameter(name).value
+
+    def close_axis(self) -> str:
+        """The tool axis the fingers close along, normalised to 'x' or 'y'.
+
+        YAML 1.1 parses a bare ``y`` as the boolean ``True`` (and ``n``, ``no``,
+        ``off`` as ``False``), so this parameter can arrive as a bool from an
+        unquoted config file. Rather than failing with an opaque type error,
+        accept it and say plainly what to fix.
+        """
+        value = self.p("gripper_close_axis")
+        if isinstance(value, bool):
+            self.get_logger().warn(
+                "gripper_close_axis arrived as a boolean: YAML read the bare "
+                f"value as {value}. Quote it in the config file "
+                '(gripper_close_axis: "y"). Assuming '
+                f"'{'y' if value else 'n'}'."
+            )
+            value = "y" if value else "n"
+        axis = str(value).strip().lower().removeprefix("tool_")
+        if axis not in ("x", "y"):
+            raise ValueError(
+                f"gripper_close_axis must be 'x' or 'y', got {value!r}. "
+                "If this came from a YAML file, quote the value."
+            )
+        return axis
 
     # ------------------------------------------------------------------ #
     # TF
@@ -288,7 +325,7 @@ class DiceChallenge:
         clearance = float(self.node.p("place_clearance_m"))
         fast = float(self.node.p("velocity_scaling"))
         slow = float(self.node.p("approach_velocity_scaling"))
-        close_axis = str(self.node.p("gripper_close_axis"))
+        close_axis = self.node.close_axis()
 
         # The fingers must close along the axis the die will turn about, and
         # square onto the die's lateral faces -- hence the die's own yaw.

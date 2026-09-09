@@ -473,8 +473,13 @@ ros2 launch dice_vision vision_in_simulation.launch.py
 **Terminal 4 — look at what it sees:**
 
 ```bash
-ros2 run rqt_image_view rqt_image_view /dice_vision/debug_image
+# rqt_image_view is not in the DRIMS image; rviz2 is. Add an Image display
+# and set its topic to /dice_vision/debug_image.
+rviz2
+
+# or check the numbers without a GUI at all
 ros2 service call /dice_vision/dice_identification easy_motion_msgs/srv/DiceIdentification "{}"
+ros2 topic hz /dice_vision/debug_image
 ```
 
 The debug image shows the board outline, the fitted top-face quad, the die's
@@ -533,9 +538,11 @@ Everything above uses `motion_mode: moveit`, which plans each waypoint to a full
 stop. To run the trajectory generator instead:
 
 ```bash
-ros2 launch dice_task dice_challenge.launch.py target_face:=2 \
-    --ros-args -p motion_mode:=trajectory
+ros2 launch dice_task dice_challenge.launch.py target_face:=2 motion_mode:=trajectory
 ```
+
+(`ros2 launch` takes launch *arguments*, `name:=value`. It has no `--ros-args`;
+that is `ros2 run` syntax.)
 
 Watch for the line it prints per segment:
 

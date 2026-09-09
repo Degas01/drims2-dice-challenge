@@ -329,7 +329,7 @@ and direction, sensor noise and JPEG quality.
 | PnP yaw error | **1.4° median, 5.0° p95** |
 | Undistortion vs OpenCV run to convergence | **agrees to 1e-9** |
 | Cycle time, blended vs stop-at-every-waypoint | **5.61 s vs 7.37 s (−24 %)** |
-| Test count | **244 passing** |
+| Test count | **266 passing** |
 
 Position error is measured end to end: detect the die, self-calibrate the
 homography from the board corners, back-project with the parallax correction,
@@ -356,14 +356,16 @@ src/dice_vision/
   dice_vision/camera_model.py         pinhole model, distortion, undistortion (no ROS)
   dice_vision/board_geometry.py       homography + pinhole pixel→metres     (no ROS)
   dice_vision/pose_estimation.py      PnP on the top face, plane refinement (no ROS)
+  dice_vision/scene_simulator.py      renders board-and-die scenes           (no ROS)
   dice_vision/dice_vision_node.py     DiceIdentification service, debug image, TF
+  dice_vision/fake_camera_node.py     synthetic camera, so vision runs in simulation
 src/dice_task/
   dice_task/die_model.py              die algebra, exact planner, blind policy (no ROS)
   dice_task/grasping.py               grasp frame, quaternions, rotation about a pivot (no ROS)
   dice_task/trajectory.py             LIN path, trapezoidal profile, SLERP, blending (no ROS)
   dice_task/cartesian_executor.py     sample → IK → JointTrajectory          (no ROS)
   dice_task/dice_task_node.py         the state machine
-tests/                                244 tests; synthetic.py renders the scenes
+tests/                                266 tests, all offline
 scripts/make_docs_images.py           regenerates every figure in this README
 ```
 
@@ -442,6 +444,113 @@ The node reports each step and finishes with a summary line:
 [dice_task] face 2 is up (target 2, bottom 5)
 [dice_task] SUCCESS: face 2 up (target 2) after 1 re-grasp(s) in 12.4 s
 ```
+
+### Running the perception in simulation
+
+The DRIMS simulation has **no camera**. `ur5e_N_start.launch.py fake:=true` gives
+you the arm and MoveIt, and `drims_dice_simulator` answers
+`/dice_identification` from ground truth — there is no image anywhere, so the
+detector has nothing to look at.
+
+`fake_camera_node` fills that hole. It watches the simulated die (its face on
+`/dice_face`, its pose on TF), renders the overhead view a camera above the board
+*would* have seen, and publishes it as an ordinary `CompressedImage` +
+`CameraInfo`. The rest of the chain is unchanged, so this exercises the real
+detector, the real camera model and the real service:
+
+```
+dice simulator ─► fake camera ─► detector ─► pose ─► state machine ─► robot
+      ▲                                                                 │
+      └─────────────────────────────────────────────────────────────────┘
+```
+
+**Terminal 3 — synthetic camera + vision:**
+
+```bash
+ros2 launch dice_vision vision_in_simulation.launch.py
+```
+
+**Terminal 4 — look at what it sees:**
+
+```bash
+ros2 run rqt_image_view rqt_image_view /dice_vision/debug_image
+ros2 service call /dice_vision/dice_identification easy_motion_msgs/srv/DiceIdentification "{}"
+```
+
+The debug image shows the board outline, the fitted top-face quad, the die's
+axes, the pip markers and the reading with its confidence.
+
+**Then drive the robot from the camera instead of from ground truth:**
+
+```bash
+ros2 launch dice_task dice_challenge.launch.py \
+    target_face:=3 strategy:=blind \
+    identification_service:=/dice_vision/dice_identification
+```
+
+`strategy:=blind` is the honest pairing: a camera sees only the top face, so this
+is the policy the real cell would use.
+
+**This is a simulated sensor, not a claim about the real one.** The renderer
+models projection, perspective, an uneven lighting gradient, a cast shadow,
+sensor noise and JPEG compression — but it cannot stand in for the real board's
+lighting or the real lens. Running the detector on the provided bags is still the
+honest final check.
+
+### Testing different die colours and lenses
+
+This is the point of the colour-agnostic design, and now it can be tested
+end to end rather than only in the test-suite. Nothing else changes:
+
+```bash
+for c in yellow red blue green_dark orange black white purple; do
+  ros2 launch dice_vision vision_in_simulation.launch.py die_colour:=$c
+done
+```
+
+`green_dark` is the one worth watching — a green die on a green board, the case a
+fixed hue threshold cannot survive.
+
+Other knobs, all live parameters on `/fake_camera`:
+
+```bash
+# a wide-angle lens with real barrel distortion
+ros2 launch dice_vision vision_in_simulation.launch.py \
+    dist_coeffs:="[-0.28, 0.09, 0.0, 0.0, 0.0]"
+
+# harsh lighting and a strong cast shadow
+ros2 launch dice_vision vision_in_simulation.launch.py \
+    light_gradient:=0.45 shadow_strength:=0.6
+
+# change the colour without restarting anything
+ros2 param set /fake_camera die_colour blue
+ros2 param set /fake_camera shadow_strength 0.7
+```
+
+### Running the generated trajectories
+
+Everything above uses `motion_mode: moveit`, which plans each waypoint to a full
+stop. To run the trajectory generator instead:
+
+```bash
+ros2 launch dice_task dice_challenge.launch.py target_face:=2 \
+    --ros-args -p motion_mode:=trajectory
+```
+
+Watch for the line it prints per segment:
+
+```
+[dice_task] executing 34 points over 1.68 s (2 stops, peak joint rate 1.21 rad/s)
+```
+
+If instead you see `trajectory rejected: ...`, it fell back to the MoveIt path
+and told you why — an unreachable sample, or an IK branch change. That is the
+intended behaviour, not a failure: the alternative is executing a joint path that
+jumps.
+
+> **`motion_mode: trajectory` bypasses MoveIt's planning-scene collision checks.**
+> Get the task working in `moveit` mode first, keep the workspace clear, and be
+> ready on the stop button the first time.
 
 ### Testing it properly
 

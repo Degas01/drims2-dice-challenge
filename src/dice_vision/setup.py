@@ -24,6 +24,7 @@ setup(
     entry_points={
         "console_scripts": [
             "dice_vision_node = dice_vision.dice_vision_node:main",
+            "fake_camera_node = dice_vision.fake_camera_node:main",
         ],
     },
 )

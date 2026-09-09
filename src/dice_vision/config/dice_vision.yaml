@@ -30,3 +30,12 @@ dice_vision:
     chroma_tolerance: 0.055
 
     min_face_confidence: 0.25
+
+    # Rectify the frame before detecting, using the distortion from CameraInfo.
+    undistort: true
+    # Cross-check the detected quad with PnP: if the four corners are not a
+    # projected square within this residual, the geometry is untrustworthy and
+    # the service reports failure rather than a confident wrong pose.
+    # PnP is deliberately not used for position -- see pose_estimation.py.
+    use_pnp_check: true
+    max_reprojection_error_px: 3.0

@@ -70,6 +70,11 @@ class SceneConfig:
     shadow_strength: float = 0.45
     shadow_offset_m: Tuple[float, float] = (0.02, 0.015)
 
+    #: Lens distortion [k1, k2, p1, p2, k3], OpenCV ordering. Real wide-angle
+    #: cameras have appreciable barrel distortion; the hands-on slides say to
+    #: undistort, so the renderer has to be able to produce it.
+    dist_coeffs: Tuple[float, float, float, float, float] = (0.0, 0.0, 0.0, 0.0, 0.0)
+
     noise_sigma: float = 2.5
     jpeg_quality: Optional[int] = 88
     blur_px: int = 0
@@ -114,9 +119,10 @@ def _camera(cfg: SceneConfig):
     return k, rvec, tvec.reshape(3)
 
 
-def _project(points_world, k, rvec, tvec):
+def _project(points_world, k, rvec, tvec, dist=None):
     pts = np.asarray(points_world, dtype=np.float64).reshape(-1, 1, 3)
-    projected, _ = cv2.projectPoints(pts, rvec, tvec, k, np.zeros(5))
+    dist = np.zeros(5) if dist is None else np.asarray(dist, dtype=np.float64)
+    projected, _ = cv2.projectPoints(pts, rvec, tvec, k, dist.reshape(1, -1))
     return projected.reshape(-1, 2)
 
 
@@ -136,6 +142,7 @@ def render(cfg: SceneConfig) -> Scene:
     rng = np.random.default_rng(cfg.seed)
     w, h = cfg.image_size
     k, rvec, tvec = _camera(cfg)
+    dist = np.asarray(cfg.dist_coeffs, dtype=np.float64)
 
     img = np.full((h, w, 3), cfg.table_bgr, np.uint8)
 
@@ -145,25 +152,25 @@ def render(cfg: SceneConfig) -> Scene:
         [[-half_x, half_y, 0.0], [half_x, half_y, 0.0],
          [half_x, -half_y, 0.0], [-half_x, -half_y, 0.0]]
     )
-    board_px = _project(board_world, k, rvec, tvec)
+    board_px = _project(board_world, k, rvec, tvec, dist)
     cv2.fillConvexPoly(img, board_px.astype(np.int32), cfg.board_bgr, cv2.LINE_AA)
 
     # Aluminium frame around the board, like the real cells.
     frame_world = board_world.copy()
     frame_world[:, 0] *= 1.05
     frame_world[:, 1] *= 1.07
-    frame_px = _project(frame_world, k, rvec, tvec)
+    frame_px = _project(frame_world, k, rvec, tvec, dist)
     cv2.polylines(img, [frame_px.astype(np.int32)], True, (170, 172, 175), 9, cv2.LINE_AA)
 
     if cfg.clutter:
-        _add_clutter(img, rng, k, rvec, tvec)
+        _add_clutter(img, rng, k, rvec, tvec, dist)
 
     # --- cast shadow, on the board plane ---
     if cfg.shadow_strength > 0:
         shadow_world = _die_corners(cfg, 0.0)
         shadow_world[:, 0] += cfg.shadow_offset_m[0]
         shadow_world[:, 1] += cfg.shadow_offset_m[1]
-        shadow_px = _project(shadow_world, k, rvec, tvec).astype(np.int32)
+        shadow_px = _project(shadow_world, k, rvec, tvec, dist).astype(np.int32)
         overlay = img.copy()
         cv2.fillConvexPoly(overlay, shadow_px, (0, 0, 0), cv2.LINE_AA)
         blurred = cv2.GaussianBlur(overlay, (31, 31), 0)
@@ -176,8 +183,8 @@ def render(cfg: SceneConfig) -> Scene:
     body, pip_colour = DIE_PALETTE[cfg.die_colour]
     top_world = _die_corners(cfg, cfg.die_size_m)
     bottom_world = _die_corners(cfg, 0.0)
-    top_px = _project(top_world, k, rvec, tvec)
-    bottom_px = _project(bottom_world, k, rvec, tvec)
+    top_px = _project(top_world, k, rvec, tvec, dist)
+    bottom_px = _project(bottom_world, k, rvec, tvec, dist)
 
     # Draw the four vertical faces first (only the ones facing the camera show).
     shaded = tuple(int(v * 0.72) for v in body)
@@ -198,8 +205,8 @@ def render(cfg: SceneConfig) -> Scene:
         lx, ly = gx * step, gy * step
         wx = cfg.die_xy_m[0] + c * lx - s * ly
         wy = cfg.die_xy_m[1] + s * lx + c * ly
-        centre = _project([[wx, wy, cfg.die_size_m]], k, rvec, tvec)[0]
-        edge = _project([[wx + radius_m, wy, cfg.die_size_m]], k, rvec, tvec)[0]
+        centre = _project([[wx, wy, cfg.die_size_m]], k, rvec, tvec, dist)[0]
+        edge = _project([[wx + radius_m, wy, cfg.die_size_m]], k, rvec, tvec, dist)[0]
         r = max(2, int(round(np.linalg.norm(edge - centre))))
         cv2.circle(img, tuple(centre.astype(int)), r, pip_colour, -1, cv2.LINE_AA)
         pip_px.append(centre)
@@ -224,7 +231,15 @@ def render(cfg: SceneConfig) -> Scene:
         die_center_px=(float(die_center_px[0]), float(die_center_px[1])),
         die_top_center_m=(float(cfg.die_xy_m[0]), float(cfg.die_xy_m[1])),
         board_quad_px=board_px.astype(np.float32),
-        extra={"pips_px": np.array(pip_px), "camera_matrix": k},
+        extra={
+            "pips_px": np.array(pip_px),
+            "camera_matrix": k,
+            "dist_coeffs": dist,
+            "rvec": rvec,
+            "tvec": tvec,
+            "top_face_px": top_px,
+            "top_face_world": top_world,
+        },
     )
 
 
@@ -246,14 +261,14 @@ def _apply_lighting(img: np.ndarray, cfg: SceneConfig) -> np.ndarray:
     return np.clip(img.astype(np.float32) * gain[..., None], 0, 255).astype(np.uint8)
 
 
-def _add_clutter(img, rng, k, rvec, tvec) -> None:
+def _add_clutter(img, rng, k, rvec, tvec, dist=None) -> None:
     """Cables, clamps and a bit of the arm intruding at the board edge."""
     h, w = img.shape[:2]
 
     # A dark cable snaking in from the left, drawn on the board plane.
     xs = np.linspace(-0.36, -0.20, 24)
     ys = 0.16 + 0.03 * np.sin(np.linspace(0, 3.4, 24)) + rng.normal(0, 0.002, 24)
-    cable = _project(np.column_stack((xs, ys, np.zeros_like(xs))), k, rvec, tvec)
+    cable = _project(np.column_stack((xs, ys, np.zeros_like(xs))), k, rvec, tvec, dist)
     cv2.polylines(img, [cable.astype(np.int32)], False, (28, 28, 32), 7, cv2.LINE_AA)
 
     # Two clamps on the near frame edge.
@@ -262,7 +277,7 @@ def _add_clutter(img, rng, k, rvec, tvec) -> None:
             [[cx - 0.035, -0.27, 0.0], [cx + 0.035, -0.27, 0.0],
              [cx + 0.035, -0.235, 0.0], [cx - 0.035, -0.235, 0.0]]
         )
-        pts = _project(corners, k, rvec, tvec).astype(np.int32)
+        pts = _project(corners, k, rvec, tvec, dist).astype(np.int32)
         cv2.fillConvexPoly(img, pts, (110, 70, 40), cv2.LINE_AA)
 
     # Corner of the table showing past the frame.

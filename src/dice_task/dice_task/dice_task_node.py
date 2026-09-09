@@ -55,6 +55,12 @@ from dice_task.die_model import (
     opposite,
     plan_from_normals,
 )
+from dice_task.cartesian_executor import (
+    estimate_joint_velocities,
+    plan_joint_trajectory,
+    to_joint_trajectory_msg,
+)
+from dice_task.trajectory import BlendedTrajectory, blend_waypoints
 from dice_task.grasping import (
     AXIS_VECTORS,
     grasp_orientation,
@@ -152,6 +158,33 @@ class DiceTaskNode(Node):
         self.declare_parameter("max_regrasps", 8)
         self.declare_parameter("settle_seconds", 0.7)
         self.declare_parameter("attached_object_id", "dice")
+
+        # Motion execution: "moveit" issues one move_to_pose per waypoint, which
+        # decelerates to a stop at every one. "trajectory" generates the
+        # Cartesian path here (LIN + SLERP + trapezoidal profile), blends the
+        # corners, solves IK per sample and sends one timed JointTrajectory --
+        # the pipeline the planning lecture draws. It is faster but bypasses
+        # MoveIt's planning-scene checks, so it is opt-in.
+        self.declare_parameter("motion_mode", "moveit")  # moveit | trajectory
+        self.declare_parameter("blend_radius_m", 0.03)
+        self.declare_parameter("sample_dt", 0.05)
+        self.declare_parameter("cartesian_v_max", 0.25)
+        self.declare_parameter("cartesian_a_max", 0.5)
+        self.declare_parameter("cartesian_w_max", 1.5)
+        self.declare_parameter("cartesian_alpha_max", 3.0)
+        self.declare_parameter("lateral_a_max", 2.0)
+        self.declare_parameter("max_joint_step", 0.6)
+        self.declare_parameter(
+            "joint_names",
+            [
+                "shoulder_pan_joint",
+                "shoulder_lift_joint",
+                "elbow_joint",
+                "wrist_1_joint",
+                "wrist_2_joint",
+                "wrist_3_joint",
+            ],
+        )
 
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
@@ -342,6 +375,80 @@ class DiceChallenge:
             max_effort=float(self.node.p("gripper_effort")),
         )
 
+    # -- the lecture's pipeline: path -> trajectory -> IK -> controller ----- #
+
+    def _solve_ik(self, position, quaternion, seed):
+        """Adapter from the executor's callable to easy_motion's get_ik."""
+        try:
+            result, solution = self.motion.get_ik(
+                self._pose(position, quaternion), seed=list(seed) if seed else None
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed solve is not fatal
+            self.log.debug(f"IK call failed: {exc}")
+            return None
+        if result.val != MoveItErrorCodes.SUCCESS or not solution:
+            return None
+        return list(solution)
+
+    def run_cartesian_path(
+        self, waypoints: List[Tuple[np.ndarray, np.ndarray]], seed=None
+    ) -> bool:
+        """Blend, time-parameterise, solve IK and execute as one trajectory.
+
+        Falls back to the waypoint-by-waypoint moves if anything about the
+        trajectory is not safe to execute -- unreachable samples, or an IK branch
+        change. Falling back is the right response: the alternative is either
+        refusing to move, or executing a joint path that is discontinuous.
+        """
+        radius = float(self.node.p("blend_radius_m"))
+        positions = [np.asarray(p, float) for p, _ in waypoints]
+        orientations = [np.asarray(q, float) for _, q in waypoints]
+
+        blended_positions = blend_waypoints(positions, radius)
+        # Re-attach orientations: hold each waypoint's orientation over the
+        # points that blending inserted around it, so a corner keeps its wrist
+        # angle instead of interpolating through the inserted samples.
+        blended: List[Tuple[np.ndarray, np.ndarray]] = []
+        for point in blended_positions:
+            nearest = int(
+                np.argmin([float(np.linalg.norm(point - p)) for p in positions])
+            )
+            blended.append((point, orientations[nearest]))
+
+        trajectory = BlendedTrajectory(
+            blended,
+            v_max=float(self.node.p("cartesian_v_max")),
+            a_max=float(self.node.p("cartesian_a_max")),
+            w_max=float(self.node.p("cartesian_w_max")),
+            alpha_max=float(self.node.p("cartesian_alpha_max")),
+            lateral_a_max=float(self.node.p("lateral_a_max")),
+        )
+        samples = trajectory.sample(float(self.node.p("sample_dt")))
+
+        plan = plan_joint_trajectory(
+            samples,
+            self._solve_ik,
+            seed=seed,
+            max_joint_step=float(self.node.p("max_joint_step")),
+        )
+        if not plan.ok:
+            self.log.warn(f"trajectory rejected: {plan.failure}")
+            self.log.warn("falling back to waypoint-by-waypoint motion")
+            return False
+
+        velocities = estimate_joint_velocities(plan)
+        self.log.info(
+            f"executing {len(plan.waypoints)} points over {plan.duration:.2f} s "
+            f"({trajectory.stop_count} stops, peak joint rate "
+            f"{float(np.max(np.abs(velocities))):.2f} rad/s)"
+        )
+        message = to_joint_trajectory_msg(plan, list(self.node.p("joint_names")))
+        result = self.motion.execute_trajectory(message)
+        if result is not None and getattr(result, "val", 0) != MoveItErrorCodes.SUCCESS:
+            self.log.error(f"trajectory execution failed: {result.val}")
+            return False
+        return True
+
     # -- one re-grasp ------------------------------------------------------ #
 
     def execute_regrasp(self, move: Regrasp) -> bool:
@@ -371,9 +478,47 @@ class DiceChallenge:
             f"{grasp_point[2]:.3f}), yaw {math.degrees(die_yaw):.1f} deg, {move}"
         )
 
+        # Lift before turning.  Turning at table height is how you drive a
+        # corner of the die into the board -- the failure the hands-on slides
+        # single out with a red cross.
+        lifted = grasp_point + np.array([0.0, 0.0, lift])
+        turned_position, turned_quaternion = rotate_about_axis(
+            lifted, quaternion, move.axis, move.quarter_turns, lifted, die_yaw
+        )
+        # Put it back down where it came from, a hair above the board so the die
+        # drops the last fraction of a millimetre instead of being pressed.
+        place = np.array([die_center[0], die_center[1], die_center[2] + clearance])
+        retreat = place + np.array([0.0, 0.0, approach])
+
+        # The cycle splits at the two points where the gripper acts; each piece
+        # is a path the robot can run without stopping.
+        approach_path = [(above, quaternion), (grasp_point, quaternion)]
+        carry_path = [
+            (grasp_point, quaternion),
+            (lifted, quaternion),
+            (turned_position, turned_quaternion),
+            (place, turned_quaternion),
+        ]
+        retreat_path = [(place, turned_quaternion), (retreat, turned_quaternion)]
+
+        # Getting *to* the start of the cycle is a free-space move; plan it with
+        # MoveIt either way, so the arm avoids the cell on the way in.
         if not self._move(above, quaternion, cartesian=False, velocity=fast):
             return False
-        if not self._move(grasp_point, quaternion, cartesian=True, velocity=slow):
+
+        trajectory_mode = str(self.node.p("motion_mode")).lower() == "trajectory"
+
+        def run(path, fallback_speeds) -> bool:
+            if trajectory_mode and self.run_cartesian_path(path):
+                return True
+            for (position, orientation), (cartesian, velocity) in zip(
+                path[1:], fallback_speeds
+            ):
+                if not self._move(position, orientation, cartesian, velocity):
+                    return False
+            return True
+
+        if not run(approach_path, [(True, slow)]):
             return False
 
         self.close_gripper()
@@ -381,36 +526,14 @@ class DiceChallenge:
             str(self.node.p("attached_object_id")), str(self.node.p("tool_frame"))
         )
 
-        # Lift before turning.  Turning at table height is how you drive a
-        # corner of the die into the board -- the failure the hands-on slides
-        # single out with a red cross.
-        lifted = grasp_point + np.array([0.0, 0.0, lift])
-        if not self._move(lifted, quaternion, cartesian=True, velocity=slow):
-            self._abort_grasp()
-            return False
-
-        pivot = lifted  # rotate about the die itself, not about the flange
-        turned_position, turned_quaternion = rotate_about_axis(
-            lifted, quaternion, move.axis, move.quarter_turns, pivot, die_yaw
-        )
-        if not self._move(turned_position, turned_quaternion, cartesian=False, velocity=fast):
-            self._abort_grasp()
-            return False
-
-        # Put it back down where it came from, a hair above the board so the
-        # die drops the last fraction of a millimetre instead of being pressed.
-        place = np.array(
-            [die_center[0], die_center[1], die_center[2] + clearance]
-        )
-        if not self._move(place, turned_quaternion, cartesian=True, velocity=slow):
+        if not run(carry_path, [(True, slow), (False, fast), (True, slow)]):
             self._abort_grasp()
             return False
 
         self.open_gripper()
         self.motion.detach_object(str(self.node.p("attached_object_id")))
 
-        retreat = place + np.array([0.0, 0.0, approach])
-        self._move(retreat, turned_quaternion, cartesian=True, velocity=slow)
+        run(retreat_path, [(True, slow)])
 
         time.sleep(float(self.node.p("settle_seconds")))
         return True

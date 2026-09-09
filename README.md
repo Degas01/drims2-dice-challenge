@@ -25,6 +25,8 @@ node wrapped around each:
 | --- | --- | --- |
 | Read the die | `dice_vision/detector.py` | The die's colour is not fixed, the board is unevenly lit, the die casts a hard shadow, and at 25 px across its pips touch. |
 | Decide how to turn it | `dice_task/die_model.py` | A gripper coming from above can only rotate the die about a horizontal axis, and a single camera cannot see which lateral face is which. |
+| Locate it in metres | `dice_vision/camera_model.py`, `board_geometry.py` | A single camera cannot measure range without a size prior, and at 25 px the size prior is 9 % out. |
+| Move without stopping | `dice_task/trajectory.py` | MoveIt plans every pose request to a full stop, and the challenge is scored on cycle time. |
 
 Everything else — the ROS nodes, launch files, parameters — is plumbing around
 those two.
@@ -32,18 +34,27 @@ those two.
 ```mermaid
 flowchart LR
     subgraph perception["dice_vision"]
-        CAM["/oak/rgb/image_raw"] --> DET["DiceDetector<br/>board → foreground → top face → pips"]
+        CAM["/oak/rgb/image_raw"] --> UND["camera_model<br/>undistort (pinhole + k1..k3, p1, p2)"]
+        UND --> DET["DiceDetector<br/>board → foreground → top face → pips"]
         DET --> MAP["board_geometry<br/>pixel → metres on the board"]
+        DET --> PNP["pose_estimation<br/>PnP: orientation + residual gate"]
     end
 
     subgraph decision["dice_task"]
         MAP --> SM["DiceChallenge<br/>state machine"]
+        PNP -.->|"quality gate"| SM
         TF["face1..6_tf<br/>(simulator only)"] -.-> SM
         SM --> PLAN["die_model<br/>exact planner / blind policy"]
         PLAN --> GR["grasping<br/>grasp frame, pose maths"]
     end
 
-    GR --> EM["easy_motion MotionClient"]
+    subgraph motion["motion generation"]
+        GR --> TRAJ["trajectory<br/>LIN + trapezoidal profile + SLERP + blend"]
+        TRAJ --> EXE["cartesian_executor<br/>sample → IK → JointTrajectory"]
+    end
+
+    EXE --> EM["easy_motion MotionClient"]
+    GR -->|"motion_mode: moveit"| EM
     EM --> MOVEIT["MoveIt 2 → UR5e + gripper"]
     MOVEIT -->|die moved| CAM
 ```
@@ -142,6 +153,52 @@ pins the improvement.
 The image→board homography calibrates itself from the board's own four corners,
 so there is nothing to hand-click.
 
+### The camera model, and why PnP is *not* used for position
+
+`camera_model.py` implements the vision lecture's pinhole model directly —
+projection in homogeneous coordinates, `P = K[R|t]`, the principal-point offset,
+and the radial–tangential distortion of "non-ideal cameras". The forward model
+has no closed-form inverse, so undistortion is a fixed-point iteration. It agrees
+with OpenCV run to convergence to **1e-9**; OpenCV's *default* `undistortPoints`
+stops after five iterations and is ~0.17 px out at the frame edge, which the test
+suite asserts rather than glosses over.
+
+With intrinsics in hand, the die's top face is a **square of known size**, which
+is exactly the input to PnP. So the obvious move is to solve for the full 6-DoF
+pose and be done. Measured against ground truth over 120 random scenes, that
+turns out to be the wrong call:
+
+| position estimator | median | p95 |
+| --- | --- | --- |
+| PnP, straight from the detector's quad | 14.6 mm | 46.7 mm |
+| PnP, refined onto the known board plane | 3.4 mm | 6.6 mm |
+| **homography onto the known board plane** | **1.5 mm** | **2.9 mm** |
+
+PnP infers range from *apparent size*, and the size is the weak link: the die is
+~25 px across and its quad comes from a morphologically processed blob, so it
+runs about **9 % too large**, which lands directly as a 9 % range error. This is
+the lecture's "distances are not perceivable any more" made concrete — one camera
+cannot measure range without a size prior, and this prior is poor.
+
+Two things follow, and both are in the code:
+
+* `refine_pose_onto_plane` keeps PnP's *bearing* (well conditioned, set by the
+  centroid) and replaces its *range* with the ray–plane intersection against the
+  known board height. That alone recovers a factor of four.
+* Even so, position comes from the homography, which depends only on the blob's
+  centroid — an average over hundreds of pixels, far less sensitive to the
+  segmentation bias than four corners are.
+
+So PnP earns its place doing what it is good at: **orientation** (yaw to 1.4°
+median) and a **reprojection residual that gates the whole detection**. If the
+four corners are not a projected square to within 3 px, the service reports
+failure instead of a confident wrong pose.
+
+Getting this comparison right required fixing my own measurement first: an
+earlier version scored PnP against an assumed nadir camera while the test scenes
+tilt and offset it, which charged PnP for my bad extrinsics and made it look four
+times worse than it is.
+
 ---
 
 ## The manipulation problem
@@ -198,6 +255,60 @@ Beating it requires more information, which is exactly what `exact` uses.
 to `blind` when they are not, so the same node runs in simulation and on the real
 robot.
 
+### Generating the motion, not just requesting it
+
+The planning lecture draws the industrial controller as a pipeline:
+
+```
+instruction stack → trajectory generation → inverse kinematics → axis controllers
+     (>10 Hz)           (>100 Hz)               (>100 Hz)            (>1 kHz)
+```
+
+`trajectory.py` and `cartesian_executor.py` implement the middle two boxes rather
+than delegating them:
+
+* **Path** — the LIN primitive, `p(s) = p_a + s (p_b − p_a)/L`.
+* **Profile** — the trapezoidal velocity profile, the minimum-time solution
+  subject to `|ṡ| ≤ v_max` and `|s̈| ≤ a_max`, degenerating to the triangular
+  case when the path is too short to reach `v_max` (the case that makes short
+  approach moves jerk). The lecture's worked example — 2 m rest-to-rest at unit
+  limits, 3 s — is a test.
+* **Orientation** — SLERP, `Q(t) = Q_a (Q_a⁻¹ Q_b)^{s(t)}`, taking the short way
+  round, and **synchronised in time** with the translation so the wrist stops
+  turning exactly when the tool arrives. A wrist still turning after the fingers
+  are down will clip the die.
+* **Blending** — the blend radius, as a parabolic corner cut.
+
+Why bother, when `move_to_pose` already works: **MoveIt plans every
+`move_to_pose` to a full stop.** A re-grasp cycle is eight waypoints, so it pays
+seven decelerations it does not need. Generating one trajectory across the whole
+path and sending it as a single `JointTrajectory` keeps the tool moving:
+
+| | duration | stops |
+| --- | --- | --- |
+| one `move_to_pose` per waypoint | 7.37 s | 8 |
+| blended, single trajectory | **5.61 s** | 4 |
+
+**−24 % on the cycle**, and cycle time is precisely what the challenge scores
+(*"max number of dice rolls in 10 min"*).
+
+Two honesty notes, both enforced by tests:
+
+* **Some stops cannot be blended away.** A pick-and-place reverses direction at
+  the grasp — down, then back up the same line, a 180° turn no radius can round.
+  The model detects such *hard corners* and stops at them; the saving comes from
+  the other corners. Blending a path and still stopping at every point is
+  *slower*, and a test pins that too, because it is tempting to credit the wrong
+  half of the change.
+* **Corner speed is capped by lateral acceleration**, `v ≤ √(a_lat·R)`. A tighter
+  blend must be taken slower — that is why a genuinely sharp corner admits no
+  speed at all.
+
+`motion_mode: trajectory` opts in. It **bypasses MoveIt's planning-scene
+collision checks**, so it is off by default, and it refuses to execute a path
+whose IK solutions jump between branches — the signature of an elbow flip that
+would sweep the arm across the cell — falling back to the MoveIt path instead.
+
 ---
 
 ## Results
@@ -215,7 +326,10 @@ and direction, sensor noise and JPEG quality.
 | Position error, median | **1.5 mm** |
 | Position error, 95th percentile | **3.0 mm** (worst case 13.6 mm) |
 | Planner correctness (exact + blind), 24 orientations × 6 targets × 2 axes | **exhaustive, all pass** |
-| Test count | **159 passing** |
+| PnP yaw error | **1.4° median, 5.0° p95** |
+| Undistortion vs OpenCV run to convergence | **agrees to 1e-9** |
+| Cycle time, blended vs stop-at-every-waypoint | **5.61 s vs 7.37 s (−24 %)** |
+| Test count | **227 passing** |
 
 Position error is measured end to end: detect the die, self-calibrate the
 homography from the board corners, back-project with the parallax correction,
@@ -237,21 +351,25 @@ pytest tests/test_die_model.py -q     # planners only, <1 s
 
 ```
 src/dice_vision/
-  dice_vision/detector.py          board/foreground segmentation, top-face
-                                   recovery, pip-grid face reading  (no ROS)
-  dice_vision/board_geometry.py    homography + pinhole pixel→metres  (no ROS)
-  dice_vision/dice_vision_node.py  DiceIdentification service, debug image, TF
+  dice_vision/detector.py             board/foreground segmentation, top-face
+                                      recovery, pip-grid face reading      (no ROS)
+  dice_vision/camera_model.py         pinhole model, distortion, undistortion (no ROS)
+  dice_vision/board_geometry.py       homography + pinhole pixel→metres     (no ROS)
+  dice_vision/pose_estimation.py      PnP on the top face, plane refinement (no ROS)
+  dice_vision/dice_vision_node.py     DiceIdentification service, debug image, TF
 src/dice_task/
-  dice_task/die_model.py           die algebra, exact planner, blind policy (no ROS)
-  dice_task/grasping.py            grasp frame, quaternions, rotation about a pivot (no ROS)
-  dice_task/dice_task_node.py      the state machine
-tests/                             159 tests; synthetic.py renders the scenes
-scripts/make_docs_images.py        regenerates every figure in this README
+  dice_task/die_model.py              die algebra, exact planner, blind policy (no ROS)
+  dice_task/grasping.py               grasp frame, quaternions, rotation about a pivot (no ROS)
+  dice_task/trajectory.py             LIN path, trapezoidal profile, SLERP, blending (no ROS)
+  dice_task/cartesian_executor.py     sample → IK → JointTrajectory          (no ROS)
+  dice_task/dice_task_node.py         the state machine
+tests/                                227 tests; synthetic.py renders the scenes
+scripts/make_docs_images.py           regenerates every figure in this README
 ```
 
-The split is deliberate: the four modules marked *no ROS* contain all of the
+The split is deliberate: the eight modules marked *no ROS* contain all of the
 reasoning and all of the failure modes, and can be run, tested and debugged on a
-laptop in under two minutes.
+laptop in about two minutes.
 
 ---
 
@@ -375,6 +493,11 @@ ros2 launch dice_task dice_challenge.launch.py \
 | `dice_vision/board_origin_in_base` | `[0.60, 0.10, -0.01]` | Board centre in the base frame; Z is the cell's `surface_height`. |
 | `dice_vision/camera_height_m` | `1.0` | Only used for the parallax correction. |
 | `dice_vision/chroma_tolerance` | `0.055` | Raise if the die is being cut into pieces; lower if shadow leaks in. |
+| `dice_vision/undistort` | `true` | Rectify using `CameraInfo`'s distortion before detecting. |
+| `dice_vision/use_pnp_check` | `true` | Reject detections whose quad is not a projected square. |
+| `dice_task/motion_mode` | `moveit` | `trajectory` runs the generated path; ~24 % faster, but skips MoveIt's collision checks. |
+| `dice_task/blend_radius_m` | `0.03` | Corner rounding. `0` disables blending. |
+| `dice_task/lateral_a_max` | `2.0` | Caps the speed through a blended corner. |
 
 ---
 
@@ -401,7 +524,12 @@ Integration problems hit while bringing this up on WSL2, and what they look like
   die in the challenge is standard, and the exact planner does not need the
   assumption.
 * **Grasp poses are not collision-checked against the board** beyond lifting
-  before rotating; MoveIt does the rest.
+  before rotating; MoveIt does the rest — and in `motion_mode: trajectory` it
+  does not, which is why that mode is opt-in.
+* **The trajectory mode assumes the arm's joint limits are not the binding
+  constraint.** The Cartesian profile is capped by Cartesian limits and the IK
+  path is only checked for branch continuity, not against joint velocity limits;
+  the controller will reject a trajectory that exceeds them.
 * **Numbers above are from synthetic scenes.** The renderer is a real pinhole
   projection with the school's own die geometry, and it is deliberately harsher
   than the recorded bags in lighting and shadow, but it is not a substitute for

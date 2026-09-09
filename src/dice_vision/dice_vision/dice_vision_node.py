@@ -52,7 +52,9 @@ from dice_vision.board_geometry import (
     HomographyMapper,
     board_to_base,
 )
+from dice_vision.camera_model import CameraModel
 from dice_vision.detector import DetectorConfig, DiceDetector
+from dice_vision.pose_estimation import estimate_top_face_pose
 
 
 class DiceVisionNode(Node):
@@ -80,6 +82,16 @@ class DiceVisionNode(Node):
         self.declare_parameter("chroma_tolerance", 0.055)
         self.declare_parameter("min_face_confidence", 0.25)
 
+        # Undistort before detecting. The hands-on slides ask for it, and on a
+        # wide-angle lens it is worth several millimetres at the board edge.
+        self.declare_parameter("undistort", True)
+        # Cross-check the homography's answer against PnP on the die's top face.
+        # PnP is not used for position -- its range comes from apparent size,
+        # which on a ~25 px die is biased by roughly 9% -- but its reprojection
+        # residual is a genuine quality signal, and its yaw is good to ~1.5 deg.
+        self.declare_parameter("use_pnp_check", True)
+        self.declare_parameter("max_reprojection_error_px", 3.0)
+
         self._bridge = CvBridge()
         self._detector = DiceDetector(self._detector_config())
         self._lock = threading.Lock()
@@ -87,6 +99,7 @@ class DiceVisionNode(Node):
         self._latest_stamp = None
         self._mapper: Optional[HomographyMapper] = None
         self._principal_point: Optional[tuple] = None
+        self._camera: Optional[CameraModel] = None
 
         sensor_qos = QoSPresetProfiles.SENSOR_DATA.value
         if self.get_parameter("compressed").value:
@@ -147,8 +160,28 @@ class DiceVisionNode(Node):
         # what the parallax correction and the top-face recovery both need.
         self._principal_point = (float(msg.k[2]), float(msg.k[5]))
         self._detector.cfg.nadir_px = self._principal_point
+        if self._camera is None:
+            self._camera = CameraModel.from_camera_info(
+                msg.k, msg.d, (int(msg.width), int(msg.height))
+            )
+            self.get_logger().info(
+                f"camera model: f=({self._camera.fx:.1f}, {self._camera.fy:.1f}) px, "
+                f"principal point {self._principal_point}, "
+                f"{'with' if self._camera.has_distortion else 'no'} distortion"
+            )
+
+    def _rectify(self, frame: np.ndarray) -> np.ndarray:
+        """Undistort if we have intrinsics and were asked to."""
+        if (
+            self._camera is None
+            or not self._camera.has_distortion
+            or not self.get_parameter("undistort").value
+        ):
+            return frame
+        return self._camera.undistort_image(frame)
 
     def _store(self, frame: np.ndarray, header) -> None:
+        frame = self._rectify(frame)
         with self._lock:
             self._latest_bgr = frame
             self._latest_stamp = header.stamp
@@ -296,6 +329,32 @@ class DiceVisionNode(Node):
             response.success = False
             response.face_number = 0
             return response
+
+        # PnP cross-check: an implausible reprojection residual means the quad
+        # is not a projected square, so the detection is geometry we should not
+        # trust even though the pips read cleanly.
+        if self.get_parameter("use_pnp_check").value and self._camera is not None:
+            limit = float(self.get_parameter("max_reprojection_error_px").value)
+            square = estimate_top_face_pose(
+                detection.quad,
+                float(self.get_parameter("dice_size_m").value),
+                self._camera.without_distortion()
+                if self.get_parameter("undistort").value
+                else self._camera,
+                max_reprojection_error=limit,
+            )
+            if square is None:
+                self.get_logger().warn(
+                    "PnP rejected the detected quad: it is not a projected square "
+                    f"within {limit:.1f} px. Reporting failure rather than a pose."
+                )
+                response.success = False
+                response.face_number = 0
+                return response
+            self.get_logger().debug(
+                f"PnP agrees: residual {square.reprojection_error:.2f} px, "
+                f"yaw {np.degrees(square.yaw_about_normal()):.1f} deg"
+            )
 
         response.face_number = int(detection.face_value)
         response.pose = pose

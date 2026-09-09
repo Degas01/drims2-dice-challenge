@@ -30,3 +30,32 @@ dice_task:
     max_regrasps: 8
     settle_seconds: 0.7
     attached_object_id: dice
+
+    # --- motion execution ---------------------------------------------------
+    # "moveit"     : one move_to_pose per waypoint. MoveIt plans each one to a
+    #                full stop, so the arm decelerates at every corner. Safe:
+    #                every motion is collision-checked against the planning scene.
+    # "trajectory" : generate the Cartesian path here (LIN + SLERP + trapezoidal
+    #                profile), blend the corners, solve IK per sample and send a
+    #                single timed JointTrajectory -- the pipeline the DRIMS
+    #                planning lecture draws. ~24% faster on a re-grasp cycle, but
+    #                it bypasses MoveIt's planning-scene checks, so it is opt-in.
+    #                Falls back to "moveit" automatically if IK fails anywhere or
+    #                the joint path would jump branches.
+    motion_mode: moveit
+
+    blend_radius_m: 0.03        # corner rounding; 0 disables blending
+    sample_dt: 0.05             # trajectory sampling period, seconds
+    cartesian_v_max: 0.25       # m/s
+    cartesian_a_max: 0.5        # m/s^2
+    cartesian_w_max: 1.5        # rad/s
+    cartesian_alpha_max: 3.0    # rad/s^2
+    lateral_a_max: 2.0          # m/s^2, caps the speed through a blended corner
+    max_joint_step: 0.6         # rad between samples before an IK branch flip is called
+    joint_names:
+      - shoulder_pan_joint
+      - shoulder_lift_joint
+      - elbow_joint
+      - wrist_1_joint
+      - wrist_2_joint
+      - wrist_3_joint

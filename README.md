@@ -329,7 +329,7 @@ and direction, sensor noise and JPEG quality.
 | PnP yaw error | **1.4° median, 5.0° p95** |
 | Undistortion vs OpenCV run to convergence | **agrees to 1e-9** |
 | Cycle time, blended vs stop-at-every-waypoint | **5.61 s vs 7.37 s (−24 %)** |
-| Test count | **227 passing** |
+| Test count | **244 passing** |
 
 Position error is measured end to end: detect the die, self-calibrate the
 homography from the board corners, back-project with the parallax correction,
@@ -363,7 +363,7 @@ src/dice_task/
   dice_task/trajectory.py             LIN path, trapezoidal profile, SLERP, blending (no ROS)
   dice_task/cartesian_executor.py     sample → IK → JointTrajectory          (no ROS)
   dice_task/dice_task_node.py         the state machine
-tests/                                227 tests; synthetic.py renders the scenes
+tests/                                244 tests; synthetic.py renders the scenes
 scripts/make_docs_images.py           regenerates every figure in this README
 ```
 

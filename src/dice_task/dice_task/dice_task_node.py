@@ -30,6 +30,7 @@ targets in ``tests/test_die_model.py``.
 from __future__ import annotations
 
 import math
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -39,6 +40,7 @@ import rclpy
 from geometry_msgs.msg import PoseStamped
 from moveit_msgs.msg import MoveItErrorCodes
 from rcl_interfaces.msg import ParameterDescriptor
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from tf2_ros import Buffer, TransformListener
 
@@ -83,7 +85,7 @@ class RunReport:
     seconds: float = 0.0
 
     def summary(self) -> str:
-        moves = sum(1 for a in self.attempts if a.move is not None)
+        moves = sum(1 for a in self.attempts if a.move is not None and a.succeeded)
         verdict = "SUCCESS" if self.success else "FAILED"
         return (
             f"{verdict}: face {self.final_face} up (target {self.target_face}) "
@@ -189,6 +191,36 @@ class DiceTaskNode(Node):
     # ------------------------------------------------------------------ #
     # TF
     # ------------------------------------------------------------------ #
+
+    def wait_for_tf(self, timeout: float = 15.0) -> bool:
+        """Block until the die frame is reachable from the base frame.
+
+        The TF buffer only fills while this node is being spun (see ``main``),
+        so this doubles as a check that the background executor is actually
+        running.  Without it the first lookup fails instantly, the node decides
+        the face frames are missing and silently drops to the blind policy --
+        which is a much worse failure than saying so.
+        """
+        base, die = str(self.p("base_frame")), str(self.p("die_frame"))
+        deadline = time.monotonic() + timeout
+        last_error = ""
+        while time.monotonic() < deadline:
+            try:
+                self._tf_buffer.lookup_transform(base, die, rclpy.time.Time())
+                return True
+            except Exception as exc:  # noqa: BLE001 - expected while TF fills
+                last_error = str(exc)
+            time.sleep(0.2)
+
+        self.get_logger().error(
+            f"no transform {base} -> {die} after {timeout:.0f} s: {last_error}"
+        )
+        self.get_logger().error(
+            "Is the cell running (ur5e_N_start.launch.py) and the die spawned "
+            "(spawn_dice.launch.py)? Check with: ros2 run tf2_ros tf2_echo "
+            f"{base} {die}"
+        )
+        return False
 
     def face_normals_in_base(self, timeout: float = 1.0) -> Optional[Dict[int, np.ndarray]]:
         """Outward normals of the six faces, in the base frame.
@@ -399,6 +431,10 @@ class DiceChallenge:
         report = RunReport(target_face=target)
         started = time.monotonic()
 
+        if not self.node.wait_for_tf():
+            report.seconds = time.monotonic() - started
+            return report
+
         if not self.go_home():
             report.seconds = time.monotonic() - started
             return report
@@ -472,6 +508,18 @@ def main(args=None) -> None:
     rclpy.init(args=args)
 
     node = DiceTaskNode()
+
+    # DiceTaskNode owns the TF listener, and a TF listener only receives /tf
+    # while its node is being executed.  MotionClient and VisionClient spin
+    # themselves when they make a call, but nothing was spinning this node, so
+    # its buffer stayed empty and every lookup failed with "base_link does not
+    # exist".  Give it its own executor on a background thread; the other two
+    # nodes keep spinning themselves, so there is no contention.
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+
     motion = MotionClient(gripper_action_name="/gripper_action_controller/gripper_cmd")
     vision = VisionClient(str(node.p("identification_service")))
 
@@ -489,6 +537,8 @@ def main(args=None) -> None:
     except Exception as exc:  # noqa: BLE001 - report cleanly rather than trace
         node.get_logger().error(f"dice task aborted: {exc}")
     finally:
+        executor.shutdown()
+        spin_thread.join(timeout=2.0)
         for n in (vision, motion, node):
             try:
                 n.destroy_node()

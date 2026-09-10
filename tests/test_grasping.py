@@ -7,6 +7,7 @@ from dice_task.die_model import FACE_NORMALS, Regrasp, apply, plan_from_normals,
 from dice_task.grasping import (
     AXIS_VECTORS,
     approach_offset,
+    flange_position,
     flip_about_approach,
     grasp_orientation,
     nearest_equivalent_grasp,
@@ -374,3 +375,76 @@ def test_approach_offset_follows_the_tool_axis_not_the_vertical():
     assert offset[2] == pytest.approx(0.10 * np.cos(TILT), abs=1e-9)
     assert abs(offset[1]) == pytest.approx(0.10 * np.sin(TILT), abs=1e-9)
     assert np.allclose(offset, -0.10 * _approach(leaning), atol=1e-9)
+
+
+# --------------------------------------------------------------------------- #
+# Reach: why the pre-grasp stands off vertically
+# --------------------------------------------------------------------------- #
+
+#: The pose the arm actually failed on, in base_link, and a UR5e's numbers.
+DIE_IN_BASE = np.array([-0.100, 0.650, 0.011])
+DIE_YAW = np.deg2rad(28.6)
+TOOL_LENGTH = 0.15
+UR5E_REACH = 0.850
+
+
+def _flange_distance(tip, quaternion):
+    return float(np.linalg.norm(flange_position(tip, quaternion, TOOL_LENGTH)))
+
+
+def test_the_flange_not_the_fingertips_is_what_has_to_reach():
+    """A 150 mm gripper is 150 mm of reach the arm does not have."""
+    quaternion = grasp_orientation("x", DIE_YAW, "y", 0.0)
+    tip = float(np.linalg.norm(DIE_IN_BASE))
+    assert _flange_distance(DIE_IN_BASE, quaternion) > tip
+
+
+def test_leaning_the_tool_moves_the_flange_at_a_fixed_grasp_point():
+    """Orientation changes reachability, which is the non-obvious part."""
+    upright = grasp_orientation("x", DIE_YAW, "y", 0.0)
+    leaning = grasp_orientation("x", DIE_YAW, "y", -TILT)
+    moved = float(
+        np.linalg.norm(
+            flange_position(DIE_IN_BASE, leaning, TOOL_LENGTH)
+            - flange_position(DIE_IN_BASE, upright, TOOL_LENGTH)
+        )
+    )
+    assert moved > 0.10, "a 45 degree lean should swing the flange over 10 cm"
+
+
+def test_a_vertical_stand_off_is_reachable_where_an_along_axis_one_is_not():
+    """The regression this file exists for.
+
+    Backing off along a leaning tool axis is the textbook stand-off, and on this
+    cell it drives the flange to 0.847 m of a UR5e's 0.850 m. That is *nominally*
+    inside the envelope, and it still fails: at 99.6% extension the arm is at a
+    shoulder singularity with the elbow straight, so the pose is unreachable in
+    practice whatever the datasheet says. MoveIt reports it as -31, "no IK
+    solution", on the free-space move before the gripper has gone anywhere.
+
+    Hence the threshold below is a *usable* reach, not the quoted one. Standing
+    off straight up reaches the same grasp at 93%, which plans immediately.
+    """
+    quaternion = grasp_orientation("x", DIE_YAW, "y", tilt_for_turn(1, TILT))
+    approach = 0.10
+    usable = 0.95 * UR5E_REACH
+
+    along = _flange_distance(DIE_IN_BASE + approach_offset(quaternion, approach), quaternion)
+    vertical = _flange_distance(DIE_IN_BASE + np.array([0.0, 0.0, approach]), quaternion)
+
+    assert along > usable, f"expected the along-axis pose to be unusable, got {along:.3f}"
+    assert vertical < usable, f"vertical stand-off regressed to {vertical:.3f} m"
+    assert along - vertical > 0.05
+
+
+def test_the_grasp_itself_stays_well_inside_the_reach_at_every_lean():
+    """Leaning must not cost so much reach that the grasp becomes marginal."""
+    for turns in (1, -1):
+        for axis in ("x", "y"):
+            quaternion = grasp_orientation(axis, DIE_YAW, "y", tilt_for_turn(turns, TILT))
+            assert _flange_distance(DIE_IN_BASE, quaternion) < 0.95 * UR5E_REACH
+
+
+def test_flange_position_is_the_tip_for_a_zero_length_tool():
+    quaternion = grasp_orientation("x", 0.3, "y", -TILT)
+    assert np.allclose(flange_position(DIE_IN_BASE, quaternion, 0.0), DIE_IN_BASE)

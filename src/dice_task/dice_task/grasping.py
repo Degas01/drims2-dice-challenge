@@ -29,6 +29,7 @@ __all__ = [
     "quaternion_distance",
     "nearest_equivalent_grasp",
     "approach_offset",
+    "flange_position",
     "rotate_about_axis",
     "AXIS_VECTORS",
 ]
@@ -234,13 +235,43 @@ def nearest_equivalent_grasp(
 def approach_offset(quaternion: Sequence[float], distance: float) -> np.ndarray:
     """Vector from a grasp pose back along the gripper's own approach axis.
 
-    Backing off along the tool axis rather than straight up is what lets the
-    fingers slide on and off the die along their own length.  With a leaning
-    grasp the two are no longer the same direction, and retreating straight up
-    from a 45-degree grasp drags a finger across the top face of the die.
+    The textbook stand-off: it slides the fingers on and off the die along their
+    own length rather than sweeping them sideways.
+
+    **It is not what this project uses for the pre-grasp**, and the reason is
+    worth keeping.  With a leaning grasp, backing off along the tool axis moves
+    the pose sideways as well as up, and sideways is the expensive direction --
+    see :func:`flange_position`.  On the DRIMS board it put the flange at
+    0.847 m of a UR5e's 0.850 m reach and IK failed outright.  A vertical
+    stand-off costs 0.789 m for the same grasp and is free of side effects,
+    because the open fingers straddle the die along the grasp axis and so never
+    touch it on a vertical descent however far the gripper leans.
+
+    Kept because it is the right primitive for a gripper whose fingers *do* have
+    to slide in past an obstruction, and because the measurement above is only
+    meaningful next to the alternative.
     """
     approach = matrix_from_quaternion(quaternion)[:, 2]
     return -float(distance) * approach
+
+
+def flange_position(
+    position: Sequence[float], quaternion: Sequence[float], tool_length: float
+) -> np.ndarray:
+    """Where the robot's flange sits when the tool tip is at ``position``.
+
+    An arm's reach is quoted to its own wrist; everything past that is payload.
+    So the question "can the robot get its fingers here" is really "can it get
+    its *flange* to a point one gripper-length back along the approach axis",
+    and a 150 mm gripper on a UR5e turns a comfortable 0.68 m grasp into a
+    marginal 0.85 m one.
+
+    It also means **orientation changes reachability at a fixed grasp point**,
+    which is not obvious: leaning the tool 45 degrees swings the flange through
+    several centimetres, and that is enough to cross the limit.
+    """
+    approach = matrix_from_quaternion(quaternion)[:, 2]
+    return np.asarray(position, dtype=float) - float(tool_length) * approach
 
 
 def rotate_about_axis(

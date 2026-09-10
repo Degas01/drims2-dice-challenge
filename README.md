@@ -6,8 +6,16 @@ board finds the die and reads its top face; a state machine decides which
 re-grasp to make; `easy_motion`/MoveIt executes it; repeat until the requested
 face is up.
 
+[![tests](https://github.com/GIACOMO-GITHUB-USERNAME/drims2-dice-challenge/actions/workflows/tests.yml/badge.svg)](https://github.com/GIACOMO-GITHUB-USERNAME/drims2-dice-challenge/actions/workflows/tests.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![ROS 2 Humble](https://img.shields.io/badge/ROS%202-Humble-22314E.svg)](https://docs.ros.org/en/humble/)
+
 Built against the school's own stack — [`drims_cells`], [`easy_motion`] and
 [`drims2_dice_simulator`] — and running inside the [DRIMS2 Docker image].
+
+**Status:** runs end to end in simulation — perception, deduction, grasp, flip,
+place — with 347 offline tests covering the parts that do not need a robot.
+Not yet run on the physical cell.
 
 <p align="center">
   <img src="docs/images/pipeline.png" alt="The perception pipeline, stage by stage" width="100%">
@@ -407,6 +415,44 @@ however far the gripper leans. And because `-31` is so uninformative, the node
 now measures the flange distance for every pose it is about to command and says
 which one is out of range, in metres, before asking MoveIt.
 
+### Where the die sits decides whether any of this works
+
+The lean above is correct and it is not sufficient, because on this cell the
+binding constraint turned out not to be geometry at all.
+
+At `y = 0.65` the arm refuses every lean with `-31`, no IK solution. At
+`y = 0.58` — same code, same target, same lean, one variable changed — the whole
+cycle runs:
+
+```
+grasping at (-0.100, 0.580, 0.011), yaw 28.6 deg, lean -45 deg, rotate +90deg about X
+face 3 is up (target 3, bottom 4)
+SUCCESS: face 3 up (target 3) after 1 re-grasp(s) in 149.9 s
+```
+
+Reach is not the explanation — the flange check passes at both positions. At
+`y = 0.65` the UR5e is extended far enough that its wrist approaches a
+singularity, and near a singularity whole *families of orientations* lose their
+IK solutions while the positions remain perfectly reachable. That is why the
+failure tracked the grasp's orientation and ignored its distance, and why IK
+timed out rather than answering.
+
+Two consequences, both in the code:
+
+* the node tries each lean as the **real approach move**, in order, ending with
+  straight down — the one orientation certain to be reachable, at the price of a
+  released rather than placed die;
+* it measures the flange distance for every pose it is about to command and says
+  which one is out of range, because `-31` on its own names neither the pose nor
+  the cause.
+
+**This is documented rather than solved.** The proper fix is to plan the *pick
+position* alongside the grasp — nudge the die to a friendlier part of the board
+first, or choose among equally valid re-grasp moves by reachability. The
+deductive policy makes that natural in principle, since its probe turn can go
+about either axis in either direction and all four are equally informative. The
+plumbing to feed reachability back into move selection is not written.
+
 Two smaller motion fixes came with it:
 
 * **The wrist no longer takes the long way round.** A grasp and the same grasp
@@ -495,7 +541,8 @@ and direction, sensor noise and JPEG quality.
 | PnP yaw error | **1.4° median, 5.0° p95** |
 | Undistortion vs OpenCV run to convergence | **agrees to 1e-9** |
 | Cycle time, blended vs stop-at-every-waypoint | **5.61 s vs 7.37 s (−24 %)** |
-| Test count | **341 passing** |
+| Test count | **347 passing** |
+| End-to-end cycle in simulation | **completed**, 1 re-grasp, die at y = 0.58 |
 
 Position error is measured end to end: detect the die, self-calibrate the
 homography from the board corners, back-project with the parallax correction,
@@ -533,7 +580,7 @@ src/dice_task/
   dice_task/trajectory.py             LIN path, trapezoidal profile, SLERP, blending (no ROS)
   dice_task/cartesian_executor.py     sample → IK → JointTrajectory          (no ROS)
   dice_task/dice_task_node.py         the state machine
-tests/                                341 tests, all offline
+tests/                                347 tests, all offline
 scripts/make_docs_images.py           regenerates every figure in this README
 ```
 
@@ -590,7 +637,7 @@ sets both the spawn bounds and the surface height, and it *overrides* any
 
 ```bash
 ros2 launch drims_dice_simulator spawn_dice.launch.py \
-    selected_cell:=1 face_up:=5 position:="[-0.1, 0.65, -0.04]"
+    face_up:=5 position:="[-0.1, 0.58, -0.04]"
 ```
 
 A position outside the selected cell's range kills the spawner immediately with
@@ -819,6 +866,15 @@ Integration problems hit while bringing this up on WSL2, and what they look like
 | The wrist spins a half turn before touching the die | A grasp and the same grasp rolled 180° about its approach axis are equally valid, and the arm was handed whichever the maths produced first. | Fixed by `nearest_equivalent_grasp`, which reads the current tool orientation from TF and picks the nearer of the two. |
 | `ros2 pkg executables dice_vision` lists only `dice_vision_node` | The workspace was built before `fake_camera_node` existed. | `colcon build --packages-select dice_vision --symlink-install` and re-source `install/setup.bash`. |
 
+## Engineering log
+
+Most of the interesting work was in the gap between "the tests pass" and "the
+robot moved". [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md) is the honest
+account: every real failure, what it looked like, what it actually was, and how
+it was proved rather than guessed — including the ones that were mine, the
+measurement bug that flattered the wrong method, and the day spent fixing grasp
+geometry when the answer was that the die was 7 cm too far from the robot.
+
 ## Known limits
 
 * **One die per board.** The detector returns the single most die-like blob. The
@@ -834,6 +890,12 @@ Integration problems hit while bringing this up on WSL2, and what they look like
   constraint.** The Cartesian profile is capped by Cartesian limits and the IK
   path is only checked for branch continuity, not against joint velocity limits;
   the controller will reject a trajectory that exceeds them.
+* **The workspace limitation above is documented, not solved.** A die near the
+  far edge of the board can be unreachable in every grasp orientation even though
+  its position is well inside the arm's envelope.
+* **No hardware run.** Everything here is simulation plus offline tests against a
+  synthetic camera; the provided rosbags are the next validation step. The
+  LabVIEW sensor/actuator work for the gripper needs the physical cell.
 * **Numbers above are from synthetic scenes.** The renderer is a real pinhole
   projection with the school's own die geometry, and it is deliberately harsher
   than the recorded bags in lighting and shadow, but it is not a substitute for

@@ -52,13 +52,16 @@ __all__ = [
     "PRIMITIVES",
     "identity_orientation",
     "orientation_from_up_and_yaw",
+    "orientation_from_two_faces",
     "up_face",
+    "face_towards",
     "apply",
     "plan_exact",
     "plan_from_normals",
     "nearest_cube_rotation",
     "CUBE_ROTATIONS",
     "next_blind_move",
+    "DeductivePolicy",
     "BlindSearchPolicy",
 ]
 
@@ -198,14 +201,44 @@ def orientation_from_up_and_yaw(up: int, yaw_quarter_turns: int = 0) -> np.ndarr
     return _rot("z", yaw_quarter_turns) @ base
 
 
-def up_face(orientation: np.ndarray) -> int:
-    """Which face of the die points at +Z for the given orientation."""
+def face_towards(orientation: np.ndarray, direction: Sequence[float]) -> int:
+    """Which face of the die points along ``direction`` for this orientation."""
+    d = np.asarray(direction, dtype=float)
     best_face, best_dot = 0, -np.inf
     for face, normal in FACE_NORMALS.items():
-        dot = float(np.dot(orientation @ normal, _WORLD_UP))
+        dot = float(np.dot(orientation @ normal, d))
         if dot > best_dot:
             best_dot, best_face = dot, face
     return best_face
+
+
+def up_face(orientation: np.ndarray) -> int:
+    """Which face of the die points at +Z for the given orientation."""
+    return face_towards(orientation, _WORLD_UP)
+
+
+def orientation_from_two_faces(
+    up_value: int, side_value: int, side_direction: Sequence[float]
+) -> Optional[np.ndarray]:
+    """Recover the die's full orientation from two observed faces.
+
+    A die is *chiral*: 1, 2 and 3 run anticlockwise about their shared vertex,
+    and no rotation can turn a die into its mirror image.  So the 24 orientations
+    produce 24 distinct ``(top face, one lateral face)`` pairs, and knowing the
+    top face plus **one** lateral face pins the orientation down completely --
+    there is nothing left to guess about the other three faces.
+
+    That is the whole reason the policy below only ever needs a single probe
+    turn.  Returns ``None`` if no orientation matches, which means the two
+    observations are mutually inconsistent (a misread face, or the die was
+    nudged between them) rather than merely incomplete.
+    """
+    if not 1 <= up_value <= 6 or not 1 <= side_value <= 6:
+        raise ValueError("face values must be in 1..6")
+    for candidate in CUBE_ROTATIONS:
+        if up_face(candidate) == up_value and face_towards(candidate, side_direction) == side_value:
+            return candidate
+    return None
 
 
 def apply(orientation: np.ndarray, move: Regrasp) -> np.ndarray:
@@ -295,81 +328,166 @@ def plan_from_normals(
 # --------------------------------------------------------------------------- #
 
 
-class BlindSearchPolicy:
+class DeductivePolicy:
     """Closed-loop policy when only the *top* face can be observed.
 
-    A single overhead camera sees the top face but cannot tell which lateral
-    face is where, so the full orientation is unknown.  The policy exploits two
-    facts that *are* known:
+    An overhead camera reads the number on the top face and nothing else, so the
+    die's full orientation is unknown.  The policy is the three-stage reasoning
+    a person uses on a real die:
 
-    * opposite faces sum to 7, so observing the top also reveals the bottom;
-    * a quarter turn about a fixed horizontal axis permutes the four faces that
-      are not aligned with that axis in a 4-cycle, and leaves the two faces on
-      the axis where they are.
+    1. **Check the top.**  If it already shows the target, leave the die alone.
+    2. **The target may be underneath.**  Opposite faces sum to seven, so the
+       bottom face is known the moment the top is read.  If the target is the
+       bottom face, two quarter turns about the same horizontal axis bring it
+       up -- 180 degrees, the shortest route from bottom to top.
+    3. **Otherwise the target is one of the four sides.**  Turn the die once by
+       90 degrees to bring a side face into view.  That single probe is enough:
+       a die is chiral, so *top plus one lateral face determines the whole
+       configuration* (:func:`orientation_from_two_faces`).  From there the
+       robot knows exactly where the target is and drives straight to it with
+       :func:`plan_exact`.
 
-    The second fact is what makes the search cheap.  After a single turn the
-    robot has observed two tops, ``f`` and ``g``, and therefore *knows the whole
-    cycle*: ``{f, 7-f, g, 7-g}``.  So:
+    Stages 2 and 3 are the same instruction to the robot -- "turn 90 degrees
+    about the current grasp axis" -- so the implementation issues one probe and
+    then always knows everything.  If the target happened to be the bottom, the
+    probe reveals a side, the deduction confirms the target is now the new
+    bottom, and one more quarter turn in the same direction finishes it: exactly
+    the "rotate twice in the same axis" of stage 2.
 
-    * the target is in that set -> keep turning about the same axis, it must
-      come up within at most three more turns;
-    * the target is not in that set -> it is one of the two faces sitting on the
-      grasp axis, so switching the grasp axis puts it into the new cycle and it
-      comes up within at most three more turns.
+    Cost, uniformly over all 24 orientations and all 6 targets:
 
-    Worst case is four re-grasps.  Averaged uniformly over all 24 orientations
-    and all six targets the cost is exactly 2.0 re-grasps, with the distribution
-    ``{0: 24, 1: 24, 2: 48, 3: 24, 4: 24}`` out of 144 cases -- and that mean is
-    not an artefact of this particular policy.  Alternating the grasp axis
-    instead of exhausting one costs the same 2.0 on average, because with only
-    the top face observable the four lateral faces are indistinguishable and any
-    policy pays ``(1+2+3+4)/4`` to disambiguate them.  Beating it requires more
-    information, which is exactly what :func:`plan_from_normals` uses when the
-    full pose is available (mean 1.0, worst case 2).
+    ==========================  ======  =============
+    where the target starts     cases   re-grasps
+    ==========================  ======  =============
+    already on top              1 / 6   0
+    the probed side             1 / 6   1
+    on the grasp axis           2 / 6   2
+    the bottom                  1 / 6   2
+    opposite the probed side    1 / 6   3
+    ==========================  ======  =============
+
+    Mean 5/3 = 1.67 re-grasps, worst case 3.  The previous cycle-walking policy
+    averaged 2.0 with a worst case of 4; deducing the configuration after one
+    probe removes a third of the arm motion.  It cannot be beaten without seeing
+    more of the die, because the four sides are indistinguishable until one of
+    them is turned up, and any first probe leaves them at 1, 2, 2 and 3 turns.
+    With the full pose available -- the simulator publishes ``face{1..6}_tf`` --
+    :func:`plan_from_normals` does better still: mean 1.0, worst case 2.
     """
 
     def __init__(self, target_face: int, first_axis: str = "x") -> None:
         if not 1 <= target_face <= 6:
             raise ValueError(f"target_face must be in 1..6, got {target_face}")
+        if first_axis not in ("x", "y"):
+            raise ValueError(f"first_axis must be 'x' or 'y', got {first_axis!r}")
         self.target_face = target_face
         self.axis = first_axis
-        # Faces known to belong to the cycle of the current grasp axis.
-        self._known_cycle: set = set()
+        #: The deduced orientation, or ``None`` while the die is still unknown.
+        self.orientation: Optional[np.ndarray] = None
+        #: One-line account of the last deduction, for logging.
+        self.reasoning: str = "nothing observed yet"
+        self._probe: Optional[Regrasp] = None
+        self._top_before_probe: Optional[int] = None
+
+    # -- knowledge --------------------------------------------------------- #
+
+    def _deduce(self, observed_face: int) -> None:
+        """Turn (top before probe, top after probe) into a full orientation."""
+        probe, before_top = self._probe, self._top_before_probe
+        self._probe = self._top_before_probe = None
+        if probe is None or before_top is None:
+            return
+
+        # The probe lifted whichever face pointed along ``direction`` onto +Z,
+        # so ``observed_face`` was the face in that direction beforehand.
+        direction = probe.matrix().T @ _WORLD_UP
+        before = orientation_from_two_faces(before_top, observed_face, direction)
+        if before is None:
+            self.reasoning = (
+                f"saw {before_top} then {observed_face} after {probe}, which no "
+                "die orientation explains; probing again"
+            )
+            return
+
+        self.orientation = apply(before, probe)
+        lateral = ", ".join(
+            f"{name}={face_towards(self.orientation, vector)}"
+            for name, vector in (
+                ("+X", (1, 0, 0)), ("-X", (-1, 0, 0)),
+                ("+Y", (0, 1, 0)), ("-Y", (0, -1, 0)),
+            )
+        )
+        self.reasoning = (
+            f"top was {before_top}, {probe.axis.upper()}-turn showed "
+            f"{observed_face}: configuration is top={up_face(self.orientation)}, "
+            f"bottom={opposite(up_face(self.orientation))}, {lateral}"
+        )
+
+    # -- the policy -------------------------------------------------------- #
 
     def observe(self, current_face: int) -> Optional[Regrasp]:
         """Report the observed top face; get the next move, or ``None`` if done."""
+        if not 1 <= current_face <= 6:
+            raise ValueError(f"observed face must be in 1..6, got {current_face}")
+
+        if self._probe is not None:
+            self._deduce(current_face)
+
         if current_face == self.target_face:
+            self.reasoning = f"face {current_face} is already up"
             return None
 
-        self._known_cycle |= {current_face, opposite(current_face)}
+        # A model that disagrees with the camera is worse than no model: the die
+        # was nudged, or a face was misread.  Drop it and probe again.
+        if self.orientation is not None and up_face(self.orientation) != current_face:
+            self.reasoning = (
+                f"expected {up_face(self.orientation)} up but saw {current_face}; "
+                "the die moved, re-deducing"
+            )
+            self.orientation = None
 
-        # Four distinct faces identified and the target is not among them: the
-        # target must lie on the grasp axis, which no amount of turning about
-        # that axis will ever lift.  Switch axis; the axis faces of the old axis
-        # are lateral faces of the new one.
-        if len(self._known_cycle) >= 4 and self.target_face not in self._known_cycle:
-            self.axis = "y" if self.axis == "x" else "x"
-            self._known_cycle = {current_face, opposite(current_face)}
+        if self.orientation is not None:
+            move = plan_exact(self.orientation, self.target_face)[0]
+            self.orientation = apply(self.orientation, move)
+            return move
 
-        return Regrasp(self.axis, 1)
+        # Nothing known beyond the top and bottom faces.  One quarter turn about
+        # the grasp axis both makes progress and reveals a side face.
+        self._probe = Regrasp(self.axis, 1)
+        self._top_before_probe = current_face
+        if self.target_face == opposite(current_face):
+            self.reasoning = (
+                f"target {self.target_face} is the bottom face (7 - {current_face}); "
+                "turning 180 degrees about the same axis, one quarter at a time"
+            )
+        else:
+            self.reasoning = (
+                f"target {self.target_face} is on a side; turning once about "
+                f"{self.axis.upper()} to read a side face and pin the configuration down"
+            )
+        return self._probe
+
+
+#: Kept so older configs and notes that say "blind" keep working.
+BlindSearchPolicy = DeductivePolicy
 
 
 def next_blind_move(
     current_face: int, target_face: int, axis: str = "x"
 ) -> Optional[Regrasp]:
-    """One-shot convenience wrapper around :class:`BlindSearchPolicy`."""
-    return BlindSearchPolicy(target_face, axis).observe(current_face)
+    """One-shot convenience wrapper around :class:`DeductivePolicy`."""
+    return DeductivePolicy(target_face, axis).observe(current_face)
 
 
 def simulate_blind(
     orientation: np.ndarray, target_face: int, first_axis: str = "x", max_moves: int = 12
 ) -> List[Regrasp]:
-    """Run :class:`BlindSearchPolicy` against a known orientation.
+    """Run :class:`DeductivePolicy` against a known orientation.
 
     Used by the test-suite to bound the worst case; the robot itself never has
-    access to ``orientation``.
+    access to ``orientation`` -- it only ever sees ``up_face(state)``.
     """
-    policy = BlindSearchPolicy(target_face, first_axis)
+    policy = DeductivePolicy(target_face, first_axis)
     moves: List[Regrasp] = []
     state = orientation
     for _ in range(max_moves):
@@ -379,7 +497,7 @@ def simulate_blind(
         state = apply(state, move)
         moves.append(move)
     raise RuntimeError(
-        f"blind policy did not converge in {max_moves} moves "
+        f"deductive policy did not converge in {max_moves} moves "
         f"(target {target_face}, first axis {first_axis})"
     )
 

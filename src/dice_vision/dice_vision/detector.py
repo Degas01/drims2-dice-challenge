@@ -42,16 +42,19 @@ Pipeline
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+
+from dice_vision.colour import ColourReading, read_die_colour
 
 __all__ = [
     "DetectorConfig",
     "Detection",
     "DiceDetector",
     "PIP_LAYOUTS",
+    "mosaic",
     "top_face_from_hull",
 ]
 
@@ -133,6 +136,9 @@ class DetectorConfig:
     min_layout_score: float = 0.18
     #: Score gap that counts as full confidence in the winning hypothesis.
     confidence_margin: float = 0.10
+    #: How far to shrink the top face before sampling its colour, as a fraction
+    #: of the half-width.  Keeps the dark seam at the face edge out of the median.
+    colour_inset: float = 0.30
 
     def board_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
         lo = np.array([self.board_hue_range[0], self.board_sat_min, self.board_val_min])
@@ -152,10 +158,18 @@ class Detection:
     pips_px: List[Tuple[float, float]] = field(default_factory=list)
     face_confidence: float = 0.0
     blob_score: float = 0.0
+    #: The die's body colour, named.  Reported, never relied on -- the detector
+    #: finds the die by subtracting the board, so an unexpected colour costs
+    #: nothing but is still worth saying out loud.
+    colour: Optional[ColourReading] = None
 
     @property
     def found_face(self) -> bool:
         return 1 <= self.face_value <= 6
+
+    @property
+    def colour_name(self) -> str:
+        return self.colour.name if self.colour is not None else "unknown"
 
 
 def _odd_kernel(size: int) -> np.ndarray:
@@ -424,6 +438,7 @@ class DiceDetector:
             pips_px=pips,
             face_confidence=confidence,
             blob_score=float(score),
+            colour=read_die_colour(bgr, quad, self.cfg.colour_inset),
         )
 
     # ------------------------------------------------------------------ #
@@ -651,11 +666,20 @@ class DiceDetector:
     # Debug overlay
     # ------------------------------------------------------------------ #
 
-    def annotate(self, bgr: np.ndarray, detection: Optional[Detection]) -> np.ndarray:
+    def annotate(
+        self,
+        bgr: np.ndarray,
+        detection: Optional[Detection],
+        board_xy_m: Optional[Tuple[float, float]] = None,
+    ) -> np.ndarray:
         """Draw the detection for the ``~/debug_image`` topic.
 
         The overlay scales with the die, so it stays readable whether the die
-        fills the frame or is 20 px across on a 1280 px board.
+        fills the frame or is 20 px across on a 1280 px board.  It carries the
+        three things a human needs to check the pipeline at a glance: the value
+        read off the top face, the die's colour (as a name *and* as a swatch of
+        the pixels the name came from, so a wrong name is obvious), and where
+        the die is on the board.
         """
         out = bgr.copy()
         quad = self.board_quad(bgr)
@@ -669,7 +693,6 @@ class DiceDetector:
 
         half = 0.5 * detection.size_px
         thickness = max(1, int(round(detection.size_px / 22.0)))
-        font_scale = float(np.clip(detection.size_px / 90.0, 0.35, 1.0))
         cx, cy = detection.center_px
 
         cv2.polylines(out, [detection.quad.astype(int)], True, (0, 0, 255),
@@ -688,15 +711,148 @@ class DiceDetector:
             cv2.circle(out, (int(px), int(py)), max(1, thickness), (0, 220, 255),
                        -1, cv2.LINE_AA)
 
-        label = f"{detection.face_value}" if detection.found_face else "?"
-        text = f"face {label}  {detection.face_confidence:.2f}"
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
-        origin = (int(cx - tw / 2), int(cy - half - 8))
-        cv2.rectangle(out, (origin[0] - 3, origin[1] - th - 4),
-                      (origin[0] + tw + 3, origin[1] + 4), (255, 255, 255), -1)
-        cv2.putText(out, text, origin, cv2.FONT_HERSHEY_SIMPLEX, font_scale,
-                    (10, 10, 10), 1, cv2.LINE_AA)
+        self._draw_readout(out, detection, board_xy_m)
         return out
+
+    def _draw_readout(
+        self,
+        out: np.ndarray,
+        detection: Detection,
+        board_xy_m: Optional[Tuple[float, float]],
+    ) -> None:
+        """The value/colour/position card pinned above the die."""
+        cx, cy = detection.center_px
+        half = 0.5 * detection.size_px
+
+        value = str(detection.face_value) if detection.found_face else "?"
+        lines = [f"{detection.colour_name} die"]
+        if detection.colour is not None:
+            lines[0] += f"  ({detection.colour.confidence:.2f})"
+        lines.append(f"pips {detection.face_confidence:.2f}")
+        if board_xy_m is not None:
+            lines.append(f"x {board_xy_m[0]:+.3f}  y {board_xy_m[1]:+.3f} m")
+        lines.append(f"yaw {np.degrees(detection.yaw_rad):+.1f} deg")
+
+        scale = float(np.clip(detection.size_px / 110.0, 0.36, 0.62))
+        line_h = int(round(26 * scale / 0.5))
+        big = float(np.clip(detection.size_px / 45.0, 0.9, 2.2))
+        (bw, bh), _ = cv2.getTextSize(value, cv2.FONT_HERSHEY_DUPLEX, big, 2)
+        widths = [cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0][0] for t in lines]
+
+        pad = 6
+        swatch = bh
+        card_w = pad * 3 + bw + swatch + max(widths) + pad
+        card_h = pad * 2 + max(bh, line_h * len(lines))
+
+        # Keep the card on screen whichever corner of the board the die is in.
+        x0 = int(np.clip(cx - card_w / 2, 4, out.shape[1] - card_w - 4))
+        y0 = int(cy - half - 10 - card_h)
+        if y0 < 4:
+            y0 = int(min(cy + half + 10, out.shape[0] - card_h - 4))
+
+        panel = out[y0:y0 + card_h, x0:x0 + card_w]
+        if panel.size:
+            # Translucent card, so the board stays visible underneath it.
+            cv2.addWeighted(panel, 0.25, np.full_like(panel, 255), 0.75, 0.0, panel)
+        cv2.rectangle(out, (x0, y0), (x0 + card_w, y0 + card_h), (60, 60, 60), 1, cv2.LINE_AA)
+
+        cv2.putText(out, value, (x0 + pad, y0 + pad + bh),
+                    cv2.FONT_HERSHEY_DUPLEX, big, (20, 20, 20), 2, cv2.LINE_AA)
+
+        if detection.colour is not None:
+            sx = x0 + pad * 2 + bw
+            cv2.rectangle(out, (sx, y0 + pad), (sx + swatch, y0 + pad + swatch),
+                          tuple(int(c) for c in detection.colour.bgr), -1)
+            cv2.rectangle(out, (sx, y0 + pad), (sx + swatch, y0 + pad + swatch),
+                          (60, 60, 60), 1, cv2.LINE_AA)
+
+        tx = x0 + pad * 3 + bw + swatch
+        for i, text in enumerate(lines):
+            cv2.putText(out, text, (tx, y0 + pad + line_h * (i + 1) - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale, (25, 25, 25), 1, cv2.LINE_AA)
+
+    def stages(
+        self,
+        bgr: np.ndarray,
+        detection: Optional[Detection] = None,
+        board_xy_m: Optional[Tuple[float, float]] = None,
+    ) -> Dict[str, np.ndarray]:
+        """Every intermediate image the hands-on session asks you to publish.
+
+        The slides build the pipeline one topic at a time -- the colour mask,
+        then the oriented bounding box, then the position and axes -- because
+        that is how you debug a vision node: you look at the stage that first
+        went wrong instead of guessing from a wrong final number.  Publishing all
+        four keeps that ability after the pipeline is finished.
+
+        Returns ``{"board_mask", "object_mask", "bounding_box", "overlay"}``,
+        all BGR and all the same size as the input, plus ``"mosaic"``: the four
+        of them tiled and labelled, so one rviz panel shows the whole pipeline.
+        """
+        if detection is None:
+            detection = self.detect(bgr)
+
+        board = self.board_mask(bgr)
+        foreground, _ = self.foreground_mask(bgr)
+
+        # Show the mask as the pixels it selects rather than as a white blob:
+        # a mask that has quietly swallowed a shadow looks identical in binary
+        # and obvious in colour.
+        object_pixels = cv2.bitwise_and(bgr, bgr, mask=foreground)
+
+        boxed = bgr.copy()
+        if detection is not None:
+            thickness = max(1, int(round(detection.size_px / 22.0)))
+            cv2.drawContours(boxed, [detection.quad.astype(np.int32)], -1,
+                             (0, 0, 255), thickness, cv2.LINE_AA)
+            cv2.circle(boxed, tuple(int(v) for v in detection.center_px),
+                       max(1, thickness), (0, 255, 255), -1, cv2.LINE_AA)
+
+        stages = {
+            "board_mask": cv2.cvtColor(board, cv2.COLOR_GRAY2BGR),
+            "object_mask": object_pixels,
+            "bounding_box": boxed,
+            "overlay": self.annotate(bgr, detection, board_xy_m),
+        }
+        stages["mosaic"] = mosaic(stages)
+        return stages
+
+
+def mosaic(
+    stages: Dict[str, np.ndarray],
+    order: Sequence[str] = ("board_mask", "object_mask", "bounding_box", "overlay"),
+    width: int = 1280,
+) -> np.ndarray:
+    """Tile the pipeline stages into one labelled image.
+
+    Four separate topics is the right structure, but watching four of them means
+    four image panels, and rviz makes that tedious.  One tiled topic shows the
+    whole pipeline in a single panel, which is what you actually want while the
+    robot is moving.
+    """
+    tiles = [stages[name] for name in order if name in stages]
+    if not tiles:
+        raise ValueError("nothing to tile")
+
+    columns = 2 if len(tiles) > 1 else 1
+    rows = int(np.ceil(len(tiles) / columns))
+    tile_w = max(1, width // columns)
+    tile_h = max(1, int(round(tile_w * tiles[0].shape[0] / tiles[0].shape[1])))
+
+    scaled = []
+    for name, tile in zip(order, tiles):
+        small = cv2.resize(tile, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
+        scale = tile_w / 900.0
+        origin = (int(14 * scale) + 2, int(38 * scale) + 2)
+        for colour, thickness in (((0, 0, 0), 4), ((255, 255, 255), 1)):
+            cv2.putText(small, name, origin, cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8 * scale, colour, max(1, int(round(thickness * scale))),
+                        cv2.LINE_AA)
+        scaled.append(small)
+
+    while len(scaled) < rows * columns:
+        scaled.append(np.zeros_like(scaled[0]))
+    return np.vstack([np.hstack(scaled[r * columns:(r + 1) * columns]) for r in range(rows)])
 
 
 def top_face_from_hull(

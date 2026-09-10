@@ -16,10 +16,14 @@ import cv2
 import numpy as np
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-sys.path[:0] = [str(ROOT / "src" / "dice_vision"), str(ROOT / "tests")]
+sys.path[:0] = [str(ROOT / "src" / "dice_vision")]
 
 from dice_vision.detector import DiceDetector  # noqa: E402
-from synthetic import DIE_PALETTE, SceneConfig, render  # noqa: E402
+from dice_vision.scene_simulator import (  # noqa: E402
+    DIE_PALETTE,
+    SceneConfig,
+    render,
+)
 
 OUT = ROOT / "docs" / "images"
 
@@ -115,11 +119,71 @@ def top_face_recovery(detector: DiceDetector) -> None:
     print("wrote top_face.png")
 
 
+def published_topics(detector: DiceDetector) -> None:
+    """The four images the node actually publishes, as the node tiles them."""
+    scene = render(SceneConfig(die_colour="yellow", face_value=5,
+                               die_xy_m=(0.06, -0.04), die_yaw_rad=0.5, seed=3))
+    detection = detector.detect(scene.image)
+    stages = detector.stages(scene.image, detection, (0.062, -0.041))
+    cv2.imwrite(str(OUT / "topics.png"), stages["mosaic"])
+    print("wrote topics.png")
+
+    # The readout card is 3% of the frame at full size, so crop and enlarge it.
+    x, y = (int(round(v)) for v in detection.center_px)
+    crop = stages["overlay"][max(0, y - 150):y + 90, max(0, x - 230):x + 230]
+    cv2.imwrite(
+        str(OUT / "readout.png"),
+        cv2.resize(crop, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_NEAREST),
+    )
+    print("wrote readout.png")
+
+
+def _readout_tiles(detector, scenes, captions):
+    tiles = []
+    for scene, caption in zip(scenes, captions):
+        detection = detector.detect(scene.image)
+        overlay = detector.annotate(scene.image, detection)
+        x, y = (int(round(v)) for v in detection.center_px)
+        crop = overlay[max(0, y - 120):y + 80, max(0, x - 170):x + 170]
+        tiles.append(_label(cv2.resize(crop, (340, 200)), caption))
+    return tiles
+
+
+def named_colours(detector: DiceDetector) -> None:
+    """Every palette colour, named, with a swatch of the sampled pixels."""
+    names = sorted(DIE_PALETTE)
+    scenes = [
+        render(SceneConfig(die_colour=name, face_value=1 + i % 6, die_size_m=0.03,
+                           die_xy_m=(0.06, -0.04), die_yaw_rad=0.5, seed=i))
+        for i, name in enumerate(names)
+    ]
+    tiles = _readout_tiles(detector, scenes, names)
+    cv2.imwrite(str(OUT / "colours.png"),
+                np.vstack([np.hstack(tiles[:4]), np.hstack(tiles[4:])]))
+    print("wrote colours.png")
+
+
+def every_face(detector: DiceDetector) -> None:
+    """All six faces on the hardest die to read: black pips on a black body."""
+    scenes = [
+        render(SceneConfig(die_colour="black", face_value=face, die_size_m=0.03,
+                           die_xy_m=(0.06, -0.04), die_yaw_rad=0.5, seed=face))
+        for face in range(1, 7)
+    ]
+    tiles = _readout_tiles(detector, scenes, [f"face {f}" for f in range(1, 7)])
+    cv2.imwrite(str(OUT / "faces.png"),
+                np.vstack([np.hstack(tiles[:3]), np.hstack(tiles[3:])]))
+    print("wrote faces.png")
+
+
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     detector = DiceDetector()
     pipeline_stages(detector)
+    published_topics(detector)
     colour_sweep(detector)
+    named_colours(detector)
+    every_face(detector)
     top_face_recovery(detector)
 
 

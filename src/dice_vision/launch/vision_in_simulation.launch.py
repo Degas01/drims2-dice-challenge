@@ -46,7 +46,6 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument("shadow_strength", default_value="0.45"),
         DeclareLaunchArgument("light_gradient", default_value="0.25"),
-        DeclareLaunchArgument("publish_mask", default_value="false"),
         DeclareLaunchArgument("rate_hz", default_value="10.0"),
     ]
 
@@ -85,7 +84,6 @@ def generate_launch_description():
             shared,
             {
                 "compressed": True,
-                "publish_mask": LaunchConfiguration("publish_mask"),
                 "publish_tf": False,
             },
         ],

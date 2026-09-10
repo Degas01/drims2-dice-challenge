@@ -11,7 +11,6 @@ dice_vision:
     base_frame: base_link
     publish_tf: false
     die_frame: dice_vision_tf
-    publish_mask: false
 
     board_size_m: [0.70, 0.50]
     # Centre of the green board in base_link, derived from the dice simulator's

@@ -11,9 +11,12 @@ import pytest
 from dice_task.die_model import (
     FACE_NORMALS,
     PRIMITIVES,
+    DeductivePolicy,
     Regrasp,
     apply,
+    face_towards,
     opposite,
+    orientation_from_two_faces,
     orientation_from_up_and_yaw,
     plan_exact,
     plan_from_normals,
@@ -165,11 +168,11 @@ def test_plan_from_normals_works_with_only_three_faces_visible():
 
 
 # --------------------------------------------------------------------------- #
-# Blind (vision-only) policy
+# Deductive (vision-only) policy
 # --------------------------------------------------------------------------- #
 
 
-def test_blind_policy_always_converges():
+def test_deductive_policy_always_converges():
     for rot in all_orientations():
         for target in range(1, 7):
             for axis in ("x", "y"):
@@ -180,17 +183,17 @@ def test_blind_policy_always_converges():
                 assert up_face(state) == target
 
 
-def test_blind_policy_worst_case_is_bounded():
+def test_deductive_policy_worst_case_is_bounded():
     worst = max(
         len(simulate_blind(rot, target, first_axis=axis))
         for rot in all_orientations()
         for target in range(1, 7)
         for axis in ("x", "y")
     )
-    assert worst <= 4, f"blind policy worst case regressed to {worst} moves"
+    assert worst <= 3, f"deductive policy worst case regressed to {worst} moves"
 
 
-def test_blind_policy_cost_distribution_is_exactly_as_documented():
+def test_deductive_policy_cost_distribution_is_exactly_as_documented():
     """Pins the numbers quoted in the README so they cannot silently drift."""
     import collections
 
@@ -200,29 +203,88 @@ def test_blind_policy_cost_distribution_is_exactly_as_documented():
             for rot in all_orientations()
             for target in range(1, 7)
         ]
-        assert collections.Counter(lengths) == {0: 24, 1: 24, 2: 48, 3: 24, 4: 24}
-        assert sum(lengths) / len(lengths) == pytest.approx(2.0)
+        # 0 already up; 1 the probed side; 2 the bottom or a grasp-axis face;
+        # 3 the face opposite the probed side.
+        assert collections.Counter(lengths) == {0: 24, 1: 24, 2: 72, 3: 24}
+        assert sum(lengths) / len(lengths) == pytest.approx(5 / 3)
 
 
-def test_exact_planner_beats_blind_planner():
+def test_exact_planner_beats_deductive_planner():
     """The whole point of using the face TFs: fewer re-grasps, hard cap of two."""
     exact = [
         len(plan_exact(rot, target))
         for rot in all_orientations()
         for target in range(1, 7)
     ]
-    blind = [
+    deduced = [
         len(simulate_blind(rot, target))
         for rot in all_orientations()
         for target in range(1, 7)
     ]
     assert sum(exact) / len(exact) == pytest.approx(1.0)
-    assert max(exact) == 2 < max(blind)
+    assert max(exact) == 2 < max(deduced)
 
 
-def test_blind_policy_stops_immediately_when_already_correct():
+def test_deductive_policy_stops_immediately_when_already_correct():
     for rot in all_orientations():
         assert simulate_blind(rot, up_face(rot)) == []
+
+
+def test_target_on_the_bottom_takes_two_turns_about_one_axis():
+    """Stage two of the user-facing rule: 180 degrees, same axis, both quarters."""
+    for rot in all_orientations():
+        target = opposite(up_face(rot))
+        moves = simulate_blind(rot, target)
+        assert len(moves) == 2
+        assert moves[0].axis == moves[1].axis
+        assert moves[0].quarter_turns == moves[1].quarter_turns
+
+
+def test_one_probe_is_enough_to_know_the_whole_die():
+    """After the single 90-degree probe the policy holds the true orientation."""
+    for rot in all_orientations():
+        for target in range(1, 7):
+            if target in (up_face(rot), opposite(up_face(rot))):
+                continue
+            policy = DeductivePolicy(target)
+            probe = policy.observe(up_face(rot))
+            assert policy.orientation is None, "nothing is known before the probe"
+            after = apply(rot, probe)
+            policy.observe(up_face(after))
+            if target == up_face(after):
+                continue  # the probe happened to finish the job
+            assert policy.orientation is not None
+            assert np.allclose(policy.orientation, apply(after, plan_exact(after, target)[0]))
+
+
+def test_deduction_survives_the_die_being_nudged():
+    """A reading that no orientation explains must not poison the model."""
+    policy = DeductivePolicy(target_face=2)
+    policy.observe(5)
+    # 5 and its opposite 2 cannot both be lateral faces after one quarter turn.
+    policy.observe(5)
+    assert policy.orientation is None
+    # ...and it keeps making legal progress rather than raising.
+    assert policy.observe(3) is not None
+
+
+def test_orientation_from_two_faces_is_unique_and_total():
+    """Every (top, +Y) pair maps to exactly one orientation, and all 24 occur."""
+    seen = set()
+    for rot in all_orientations():
+        top, side = up_face(rot), face_towards(rot, (0, 1, 0))
+        assert (top, side) not in seen
+        seen.add((top, side))
+        recovered = orientation_from_two_faces(top, side, (0, 1, 0))
+        assert recovered is not None
+        assert np.allclose(recovered, rot)
+    assert len(seen) == 24
+
+
+def test_orientation_from_two_faces_rejects_impossible_pairs():
+    for top in range(1, 7):
+        assert orientation_from_two_faces(top, top, (0, 1, 0)) is None
+        assert orientation_from_two_faces(top, opposite(top), (0, 1, 0)) is None
 
 
 # --------------------------------------------------------------------------- #

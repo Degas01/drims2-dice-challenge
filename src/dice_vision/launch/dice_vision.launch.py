@@ -30,7 +30,6 @@ def generate_launch_description():
                 "running, or two publishers will fight over the same frame."
             ),
         ),
-        DeclareLaunchArgument("publish_mask", default_value="false"),
         DeclareLaunchArgument(
             "params_file",
             default_value=PathJoinSubstitution(
@@ -49,7 +48,6 @@ def generate_launch_description():
             {
                 "compressed": LaunchConfiguration("compressed"),
                 "publish_tf": LaunchConfiguration("publish_tf"),
-                "publish_mask": LaunchConfiguration("publish_mask"),
             },
         ],
         remappings=[

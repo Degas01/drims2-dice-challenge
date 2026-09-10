@@ -14,7 +14,7 @@ the base frame with a single yaw rotation.
 
 from __future__ import annotations
 
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -24,6 +24,11 @@ __all__ = [
     "yaw_rotation",
     "normals_in_grasp_frame",
     "grasp_orientation",
+    "tilt_for_turn",
+    "flip_about_approach",
+    "quaternion_distance",
+    "nearest_equivalent_grasp",
+    "approach_offset",
     "rotate_about_axis",
     "AXIS_VECTORS",
 ]
@@ -119,10 +124,19 @@ def normals_in_grasp_frame(
     return {face: rot @ np.asarray(n, dtype=float) for face, n in normals_in_base.items()}
 
 
+def _rotation_about(axis: np.ndarray, angle: float) -> np.ndarray:
+    """Rodrigues rotation about an arbitrary unit axis."""
+    k = np.asarray(axis, dtype=float)
+    k = k / np.linalg.norm(k)
+    c, s = np.cos(angle), np.sin(angle)
+    skew = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+    return np.eye(3) * c + s * skew + (1 - c) * np.outer(k, k)
+
+
 def grasp_orientation(
-    grasp_axis: str, die_yaw: float = 0.0, close_axis: str = "y"
+    grasp_axis: str, die_yaw: float = 0.0, close_axis: str = "y", tilt: float = 0.0
 ) -> np.ndarray:
-    """Orientation of the tool for a top-down grasp, as ``[x, y, z, w]``.
+    """Orientation of the tool for a grasp, as ``[x, y, z, w]``.
 
     Parameters
     ----------
@@ -136,6 +150,18 @@ def grasp_orientation(
         Which axis of the *tool* frame the fingers close along.  Robotiq-style
         grippers close along the tool Y; set ``"x"`` for a tool that closes
         along X.
+    tilt:
+        Radians to lean the approach away from vertical, rotating about the
+        closing axis.  Zero is straight down.  The fingers close along
+        ``grasp_axis`` whatever the tilt, so they still land flat on the same
+        two faces -- leaning only decides where the *body* of the gripper sits.
+
+        That freedom is what makes a 90-degree flip work at all.  A flip rotates
+        the tool by the same 90 degrees as the die, so a grasp that starts
+        straight down ends up pointing sideways, with the gripper body swinging
+        through the height of the die -- and the board.  Starting at -45 degrees
+        ends at +45, so the gripper leans over the die at both ends and never
+        goes near horizontal.  See :func:`tilt_for_turn`.
     """
     if grasp_axis not in ("x", "y"):
         raise ValueError(f"grasp_axis must be 'x' or 'y', got {grasp_axis!r}")
@@ -154,7 +180,67 @@ def grasp_orientation(
         tool_y = np.cross(tool_z, tool_x)
 
     rot = np.column_stack((tool_x, tool_y, tool_z))
+    if abs(tilt) > 1e-9:
+        rot = _rotation_about(closing, tilt) @ rot
     return quaternion_from_matrix(rot)
+
+
+def tilt_for_turn(quarter_turns: int, tilt: float) -> float:
+    """The lean to start a turn with, so the finish leans the opposite way.
+
+    A turn of ``+90`` degrees adds 90 to the approach angle, so starting at
+    ``-tilt`` finishes at ``+tilt``: the excursion is centred on vertical
+    instead of running from vertical to horizontal.
+    """
+    return -float(np.sign(quarter_turns)) * abs(tilt)
+
+
+def flip_about_approach(quaternion: Sequence[float]) -> np.ndarray:
+    """The same grasp with the gripper rolled 180 degrees about its own axis.
+
+    The fingers swap sides, which grips exactly the same pair of faces from
+    exactly the same direction -- so both orientations are equally valid, and
+    the arm should be given whichever one its wrist is already nearer to.
+    Handing it the wrong one costs a 180-degree spin of the last joint before
+    the gripper has even touched the die.
+    """
+    rot = matrix_from_quaternion(quaternion)
+    return quaternion_from_matrix(rot @ _rotation_about(np.array([0.0, 0.0, 1.0]), np.pi))
+
+
+def quaternion_distance(a: Sequence[float], b: Sequence[float]) -> float:
+    """Angle in radians between two orientations, ignoring quaternion sign."""
+    dot = abs(float(np.dot(np.asarray(a, float), np.asarray(b, float))))
+    return float(2.0 * np.arccos(np.clip(dot, -1.0, 1.0)))
+
+
+def nearest_equivalent_grasp(
+    quaternion: Sequence[float], reference: Optional[Sequence[float]]
+) -> np.ndarray:
+    """Pick between a grasp and its 180-degree roll, whichever is nearer.
+
+    ``reference`` is the tool's current orientation.  With no reference the
+    original is kept, so behaviour without TF is unchanged.
+    """
+    quaternion = np.asarray(quaternion, dtype=float)
+    if reference is None:
+        return quaternion
+    flipped = flip_about_approach(quaternion)
+    if quaternion_distance(flipped, reference) < quaternion_distance(quaternion, reference):
+        return flipped
+    return quaternion
+
+
+def approach_offset(quaternion: Sequence[float], distance: float) -> np.ndarray:
+    """Vector from a grasp pose back along the gripper's own approach axis.
+
+    Backing off along the tool axis rather than straight up is what lets the
+    fingers slide on and off the die along their own length.  With a leaning
+    grasp the two are no longer the same direction, and retreating straight up
+    from a 45-degree grasp drags a finger across the top face of the die.
+    """
+    approach = matrix_from_quaternion(quaternion)[:, 2]
+    return -float(distance) * approach
 
 
 def rotate_about_axis(

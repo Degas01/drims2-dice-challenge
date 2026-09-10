@@ -2,7 +2,7 @@
 dice_task:
   ros__parameters:
     target_face: 1
-    strategy: auto          # auto | exact | blind
+    strategy: auto          # auto | exact | deduce
 
     base_frame: base_link
     die_frame: dice_tf      # published by drims_dice_simulator
@@ -22,6 +22,20 @@ dice_task:
     gripper_close_axis: "y"   # which tool axis the fingers close along
 
     dice_size_m: 0.027
+    # How far the gripper leans off vertical to grasp, in degrees.
+    #
+    # A 90-degree flip rotates the tool by the same 90 degrees as the die, so a
+    # grasp taken straight down (0) has to finish pointing horizontally -- and a
+    # horizontal gripper cannot be lowered to the board, because its own body
+    # gets there first. That is what MoveIt was reporting as error 99999: the
+    # Cartesian planner completed 75% of the descent and stopped, right where
+    # the gripper reaches the board.
+    #
+    # 45 splits the excursion either side of vertical: the gripper leans over
+    # the die at -45 to pick it up and at +45 to set it down, and is never
+    # horizontal. The fingers close along the same axis whatever the lean, so
+    # they still land flat on the same two faces.
+    grasp_tilt_deg: 45.0
     approach_height_m: 0.10
     lift_height_m: 0.12
     place_clearance_m: 0.004

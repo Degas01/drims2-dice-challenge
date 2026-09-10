@@ -24,7 +24,7 @@ def generate_launch_description():
             description=(
                 "auto: use the face TF frames when present, else close the loop "
                 "on the camera alone. exact: require the face frames. "
-                "blind: camera only, as on the real cell."
+                "deduce: camera only, as on the real cell."
             ),
         ),
         DeclareLaunchArgument("dice_size_m", default_value="0.03"),

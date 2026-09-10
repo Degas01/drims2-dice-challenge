@@ -12,10 +12,22 @@ Topics
 launch file) accepts either ``sensor_msgs/CompressedImage`` or
 ``sensor_msgs/Image``; the type is chosen with the ``compressed`` parameter.
 
-``~/debug_image`` (published) carries the annotated frame: board outline, the
-fitted top-face quad, the die's axes, the pip markers and the face reading.
-``~/mask`` (published, optional) carries the foreground mask, which is the first
-thing to look at when a detection goes wrong.
+Five debug topics publish the pipeline one stage at a time, which is how the
+hands-on session builds it:
+
+===================  ==========================================================
+``~/board_mask``     the segmented green board
+``~/object_mask``    everything on the board that is not board-coloured, shown
+                     in its own colours rather than as a white blob
+``~/bounding_box``   the oriented bounding box and centre
+``~/overlay``        the readout: face value, die colour (name and swatch),
+                     position on the board and yaw.  Also published as
+                     ``~/debug_image``
+``~/mosaic``         all four tiled and labelled, for a single rviz panel
+===================  ==========================================================
+
+Each is rendered only while something is subscribed, so leaving them all
+enabled costs nothing.
 
 Services
 --------
@@ -65,7 +77,6 @@ class DiceVisionNode(Node):
         self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("publish_tf", False)
         self.declare_parameter("die_frame", "dice_vision_tf")
-        self.declare_parameter("publish_mask", False)
 
         # Board geometry.  Defaults come from the DRIMS vision hands-on: the
         # board is roughly 700 x 500 mm with the origin at its centre.
@@ -110,8 +121,16 @@ class DiceVisionNode(Node):
             self.create_subscription(Image, "~/image", self._on_image, sensor_qos)
         self.create_subscription(CameraInfo, "~/camera_info", self._on_info, sensor_qos)
 
-        self._debug_pub = self.create_publisher(Image, "~/debug_image", 1)
-        self._mask_pub = self.create_publisher(Image, "~/mask", 1)
+        # One topic per stage of the pipeline, in the order the hands-on session
+        # builds them.  Each is only rendered when something is subscribed, so
+        # leaving them all declared costs nothing when nobody is looking.
+        self._stage_pubs = {
+            name: self.create_publisher(Image, f"~/{name}", 1)
+            for name in ("board_mask", "object_mask", "bounding_box", "overlay", "mosaic")
+        }
+        # The finished overlay under its conventional name as well, so existing
+        # rviz layouts and the launch file keep working.
+        self._stage_pubs["debug_image"] = self.create_publisher(Image, "~/debug_image", 1)
         self._broadcaster = TransformBroadcaster(self)
 
         self._service = self.create_service(
@@ -187,22 +206,60 @@ class DiceVisionNode(Node):
             self._latest_stamp = header.stamp
 
         detection = self._detector.detect(frame)
-        if self._debug_pub.get_subscription_count() > 0:
-            annotated = self._detector.annotate(frame, detection)
-            out = self._bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
-            out.header = header
-            self._debug_pub.publish(out)
-
-        if self.get_parameter("publish_mask").value and self._mask_pub.get_subscription_count() > 0:
-            mask, _ = self._detector.foreground_mask(frame)
-            out = self._bridge.cv2_to_imgmsg(mask, encoding="mono8")
-            out.header = header
-            self._mask_pub.publish(out)
+        self._publish_stages(frame, detection, header)
 
         if detection is not None and self.get_parameter("publish_tf").value:
             pose = self._pose_from_detection(frame, detection)
             if pose is not None:
                 self._broadcast(pose)
+
+    def _board_xy(self, frame: np.ndarray, detection) -> Optional[tuple]:
+        """The die's position on the board, in metres, for the overlay."""
+        if detection is None:
+            return None
+        mapper = self._ensure_mapper(frame)
+        if mapper is None:
+            return None
+        x, y, _ = mapper.pixel_to_board(
+            detection.center_px, height=float(self.get_parameter("dice_size_m").value)
+        )
+        return float(x), float(y)
+
+    def _publish_stages(self, frame: np.ndarray, detection, header) -> None:
+        """Publish whichever pipeline stages somebody is actually watching.
+
+        The stages are the ones the vision hands-on walks through -- the board
+        mask, the die pixels alone, the oriented bounding box, and the finished
+        readout -- and they exist for the same reason the session introduces
+        them one at a time: when a detection is wrong, the stage where it first
+        goes wrong tells you why, and a single final overlay does not.
+        """
+        wanted = {
+            name: pub
+            for name, pub in self._stage_pubs.items()
+            if pub.get_subscription_count() > 0
+        }
+        if not wanted:
+            return
+
+        # The full overlay is the only stage that needs the board homography,
+        # and only to print the position; skip the work if nothing wants it.
+        needs_overlay = {"overlay", "debug_image"} & set(wanted)
+        board_xy = self._board_xy(frame, detection) if needs_overlay else None
+
+        if wanted.keys() <= {"overlay", "debug_image"}:
+            images = {"overlay": self._detector.annotate(frame, detection, board_xy)}
+        else:
+            images = self._detector.stages(frame, detection, board_xy)
+        images["debug_image"] = images["overlay"]
+
+        for name, pub in wanted.items():
+            image = images.get(name)
+            if image is None:
+                continue
+            message = self._bridge.cv2_to_imgmsg(image, encoding="bgr8")
+            message.header = header
+            pub.publish(message)
 
     # ------------------------------------------------------------------ #
     # Geometry
@@ -360,7 +417,7 @@ class DiceVisionNode(Node):
         response.pose = pose
         response.success = True
         self.get_logger().info(
-            f"face {detection.face_value} at "
+            f"{detection.colour_name} die, face {detection.face_value} at "
             f"({pose.pose.position.x:.3f}, {pose.pose.position.y:.3f}) "
             f"confidence {detection.face_confidence:.2f}"
         )

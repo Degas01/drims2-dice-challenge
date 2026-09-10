@@ -16,13 +16,16 @@ Two planning strategies
     average.  Those frames come from ``drims_dice_simulator``, so this is the
     simulation strategy.
 
-``blind``
+``deduce``
     Uses only the top face, which is all a single overhead camera can see, and
-    closes the loop: turn, look again, turn again.  Two re-grasps on average,
-    four in the worst case.  This is the strategy that works on the real cell.
+    closes the loop: check the top, and if it is wrong turn the die once to read
+    a side face.  Because a die is chiral, that one reading pins down the whole
+    configuration, and the robot then drives straight at the target.  1.67
+    re-grasps on average, three in the worst case.  This is the strategy that
+    works on the real cell.
 
 ``auto`` (the default) uses ``exact`` when the face frames are available and
-falls back to ``blind`` when they are not, so the same node runs in both places.
+falls back to ``deduce`` when they are not, so the same node runs in both places.
 Both strategies are proved correct offline over all 24 orientations and all six
 targets in ``tests/test_die_model.py``.
 """
@@ -48,8 +51,8 @@ from easy_motion.motion_client import MotionClient
 from easy_motion_msgs.srv import DiceIdentification
 
 from dice_task.die_model import (
-    BlindSearchPolicy,
     FACE_NORMALS,
+    DeductivePolicy,
     Regrasp,
     describe_plan,
     opposite,
@@ -63,9 +66,12 @@ from dice_task.cartesian_executor import (
 from dice_task.trajectory import BlendedTrajectory, blend_waypoints
 from dice_task.grasping import (
     AXIS_VECTORS,
+    approach_offset,
     grasp_orientation,
+    nearest_equivalent_grasp,
     normals_in_grasp_frame,
     rotate_about_axis,
+    tilt_for_turn,
     yaw_rotation,
 )
 
@@ -138,7 +144,7 @@ class DiceTaskNode(Node):
         super().__init__("dice_task")
 
         self.declare_parameter("target_face", 1)
-        self.declare_parameter("strategy", "auto")  # auto | exact | blind
+        self.declare_parameter("strategy", "auto")  # auto | exact | deduce
         self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("die_frame", "dice_tf")
         self.declare_parameter("tool_frame", "tool0")
@@ -163,6 +169,11 @@ class DiceTaskNode(Node):
         )
 
         self.declare_parameter("dice_size_m", 0.027)
+        # How far the gripper leans off vertical to grasp, in degrees.  45 puts
+        # the 90-degree flip symmetrically either side of vertical so neither
+        # end of it is horizontal; 0 restores the old straight-down grasp, which
+        # cannot put the die back down after a flip.
+        self.declare_parameter("grasp_tilt_deg", 45.0)
         self.declare_parameter("approach_height_m", 0.10)
         self.declare_parameter("lift_height_m", 0.12)
         self.declare_parameter("place_clearance_m", 0.004)
@@ -244,7 +255,7 @@ class DiceTaskNode(Node):
         The TF buffer only fills while this node is being spun (see ``main``),
         so this doubles as a check that the background executor is actually
         running.  Without it the first lookup fails instantly, the node decides
-        the face frames are missing and silently drops to the blind policy --
+        the face frames are missing and silently drops to the deductive policy --
         which is a much worse failure than saying so.
         """
         base, die = str(self.p("base_frame")), str(self.p("die_frame"))
@@ -291,6 +302,25 @@ class DiceTaskNode(Node):
             rot = _matrix_from_quaternion((q.x, q.y, q.z, q.w))
             normals[face] = rot[:, 2]
         return normals
+
+    def lookup_tool_orientation(self, timeout: float = 0.5) -> Optional[np.ndarray]:
+        """Current tool orientation as ``[x, y, z, w]``, or ``None``.
+
+        Only used to break the tie between two equally valid grasps, so a
+        failed lookup is not worth a warning -- it just means the arm takes
+        whichever roll the maths produced first.
+        """
+        try:
+            transform = self._tf_buffer.lookup_transform(
+                str(self.p("base_frame")),
+                str(self.p("tip_frame")),
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=timeout),
+            )
+        except Exception:  # noqa: BLE001 - optional refinement
+            return None
+        q = transform.transform.rotation
+        return np.array([q.x, q.y, q.z, q.w], dtype=float)
 
     def lookup_die_pose(self, timeout: float = 2.0) -> Optional[Tuple[np.ndarray, float]]:
         """Die centre and yaw in the base frame, from the die TF frame."""
@@ -471,7 +501,6 @@ class DiceChallenge:
             return False
         die_center, die_yaw = pose
 
-        dice_size = float(self.node.p("dice_size_m"))
         approach = float(self.node.p("approach_height_m"))
         lift = float(self.node.p("lift_height_m"))
         clearance = float(self.node.p("place_clearance_m"))
@@ -479,16 +508,35 @@ class DiceChallenge:
         slow = float(self.node.p("approach_velocity_scaling"))
         close_axis = self.node.close_axis()
 
+        # Lean the gripper away from vertical, in the direction that leaves it
+        # leaning the *other* way by the same amount once the turn is done.
+        #
+        # This is the fix for the run that kept aborting with MoveIt error 99999
+        # after a clean pick.  A straight-down grasp has to finish a 90-degree
+        # flip pointing horizontally, and a horizontal gripper cannot be lowered
+        # to the board -- its own body is in the way.  MoveIt said as much: the
+        # Cartesian planner got 75% of the way down and stopped, which is
+        # exactly where the gripper reaches the board.  Splitting the excursion
+        # either side of vertical means neither end is horizontal and the die
+        # can be set down instead of dropped.
+        tilt = tilt_for_turn(move.quarter_turns, math.radians(float(self.node.p("grasp_tilt_deg"))))
+
         # The fingers must close along the axis the die will turn about, and
         # square onto the die's lateral faces -- hence the die's own yaw.
-        quaternion = grasp_orientation(move.axis, die_yaw, close_axis)
+        quaternion = grasp_orientation(move.axis, die_yaw, close_axis, tilt)
+        # Two rolls of the wrist grip the same faces from the same side; take
+        # whichever one the wrist is already nearer to.
+        quaternion = nearest_equivalent_grasp(
+            quaternion, self.node.lookup_tool_orientation()
+        )
 
         grasp_point = die_center.copy()
-        above = grasp_point + np.array([0.0, 0.0, approach])
+        above = grasp_point + approach_offset(quaternion, approach)
 
         self.log.info(
             f"grasping at ({grasp_point[0]:.3f}, {grasp_point[1]:.3f}, "
-            f"{grasp_point[2]:.3f}), yaw {math.degrees(die_yaw):.1f} deg, {move}"
+            f"{grasp_point[2]:.3f}), yaw {math.degrees(die_yaw):.1f} deg, "
+            f"lean {math.degrees(tilt):+.0f} deg, {move}"
         )
 
         # Lift before turning.  Turning at table height is how you drive a
@@ -501,7 +549,7 @@ class DiceChallenge:
         # Put it back down where it came from, a hair above the board so the die
         # drops the last fraction of a millimetre instead of being pressed.
         place = np.array([die_center[0], die_center[1], die_center[2] + clearance])
-        retreat = place + np.array([0.0, 0.0, approach])
+        retreat = place + approach_offset(turned_quaternion, approach)
 
         # The cycle splits at the two points where the gripper acts; each piece
         # is a path the robot can run without stopping.
@@ -575,7 +623,7 @@ class DiceChallenge:
             report.seconds = time.monotonic() - started
             return report
 
-        policy: Optional[BlindSearchPolicy] = None
+        policy: Optional[DeductivePolicy] = None
         max_regrasps = int(self.node.p("max_regrasps"))
 
         for index in range(max_regrasps + 1):
@@ -596,8 +644,8 @@ class DiceChallenge:
                 self.log.error("no move available; giving up")
                 report.attempts.append(Attempt(index, face, None, used, 0.0, False))
                 break
-            if used == "blind" and policy is None:
-                policy = self._blind_policy
+            if used == "deduce" and policy is None:
+                policy = self._policy
             self.log.info(f"plan: {describe_plan([move])} [{used}]")
 
             step_started = time.monotonic()
@@ -618,9 +666,21 @@ class DiceChallenge:
         return report
 
     def _next_move(
-        self, face: int, target: int, strategy: str, policy: Optional[BlindSearchPolicy]
+        self, face: int, target: int, strategy: str, policy: Optional[DeductivePolicy]
     ) -> Tuple[Optional[Regrasp], str]:
-        """Pick the next re-grasp, preferring the exact planner when possible."""
+        """Pick the next re-grasp, preferring the exact planner when possible.
+
+        ``strategy`` is one of:
+
+        ``exact``
+            Use the simulator's ``face{1..6}_tf`` frames, which give the die's
+            full orientation, and drive straight at the target.
+        ``deduce`` (``blind``)
+            Pretend only the top face is visible -- which is all a real overhead
+            camera gives you -- and use :class:`DeductivePolicy`.
+        ``auto``
+            ``exact`` when the face frames are published, ``deduce`` otherwise.
+        """
         if strategy in ("auto", "exact"):
             normals = self.node.face_normals_in_base()
             pose = self.node.lookup_die_pose()
@@ -632,12 +692,14 @@ class DiceChallenge:
             if strategy == "exact":
                 self.log.error("face frames unavailable and strategy is 'exact'")
                 return None, "exact"
-            self.log.info("face frames unavailable; falling back to the blind policy")
+            self.log.info("face frames unavailable; deducing from the top face alone")
 
         if policy is None:
-            policy = BlindSearchPolicy(target)
-            self._blind_policy = policy
-        return policy.observe(face), "blind"
+            policy = DeductivePolicy(target)
+            self._policy = policy
+        move = policy.observe(face)
+        self.log.info(f"reasoning: {policy.reasoning}")
+        return move, "deduce"
 
 
 def main(args=None) -> None:

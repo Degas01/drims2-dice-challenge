@@ -66,7 +66,7 @@ from dice_task.cartesian_executor import (
 from dice_task.trajectory import BlendedTrajectory, blend_waypoints
 from dice_task.grasping import (
     AXIS_VECTORS,
-    approach_offset,
+    flange_position,
     grasp_orientation,
     nearest_equivalent_grasp,
     normals_in_grasp_frame,
@@ -174,6 +174,13 @@ class DiceTaskNode(Node):
         # end of it is horizontal; 0 restores the old straight-down grasp, which
         # cannot put the die back down after a flip.
         self.declare_parameter("grasp_tilt_deg", 45.0)
+        # The arm's reach, to its own flange. A UR5e is 850 mm. Used only to
+        # turn MoveIt's opaque "-31 / no IK solution" into a message that says
+        # which pose was out of range and by how much. Set 0 to disable.
+        self.declare_parameter("reach_radius_m", 0.850)
+        self.declare_parameter("reach_warn_fraction", 0.92)
+        # Flange to fingertips; read from TF when available, this is the fallback.
+        self.declare_parameter("tool_length_m", 0.15)
         self.declare_parameter("approach_height_m", 0.10)
         self.declare_parameter("lift_height_m", 0.12)
         self.declare_parameter("place_clearance_m", 0.004)
@@ -212,6 +219,7 @@ class DiceTaskNode(Node):
 
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
+        self._tool_length: Optional[float] = None
 
     # ------------------------------------------------------------------ #
     # Parameter helpers
@@ -302,6 +310,33 @@ class DiceTaskNode(Node):
             rot = _matrix_from_quaternion((q.x, q.y, q.z, q.w))
             normals[face] = rot[:, 2]
         return normals
+
+    def tool_length(self) -> float:
+        """Distance from the flange to the tool tip, in metres.
+
+        Measured from TF (``tool_frame`` -> ``tip_frame``) so it follows
+        whatever gripper is actually mounted, and cached because it cannot
+        change while the node is running. Falls back to the parameter if TF is
+        not up yet.
+        """
+        if self._tool_length is not None:
+            return self._tool_length
+
+        fallback = float(self.p("tool_length_m"))
+        try:
+            transform = self._tf_buffer.lookup_transform(
+                str(self.p("tool_frame")), str(self.p("tip_frame")), rclpy.time.Time()
+            )
+        except Exception:  # noqa: BLE001 - fall back quietly, this is a refinement
+            return fallback
+
+        t = transform.transform.translation
+        self._tool_length = float(math.sqrt(t.x * t.x + t.y * t.y + t.z * t.z))
+        self.get_logger().info(
+            f"tool length {self._tool_length * 1000:.0f} mm "
+            f"({self.p('tool_frame')} -> {self.p('tip_frame')})"
+        )
+        return self._tool_length
 
     def lookup_tool_orientation(self, timeout: float = 0.5) -> Optional[np.ndarray]:
         """Current tool orientation as ``[x, y, z, w]``, or ``None``.
@@ -492,6 +527,47 @@ class DiceChallenge:
             return False
         return True
 
+    # -- reachability ------------------------------------------------------ #
+
+    def warn_if_near_reach_limit(self, label: str, position, quaternion) -> bool:
+        """Say so, loudly, when a pose is close to the arm's reach.
+
+        MoveIt reports an unreachable pose as ``-31`` ("no IK solution"), which
+        is true but says nothing about *why* -- and the arm has usually not
+        moved, so there is nothing to look at either. Reach is the most common
+        cause on this cell, because the die can sit most of a metre from the
+        base and the gripper adds another 150 mm beyond the flange, so it is
+        worth measuring explicitly and naming.
+
+        The number that matters is the distance to the **flange**, not to the
+        fingertips: the arm's reach is quoted to its own wrist, and everything
+        past that is payload. That is also why gripper orientation changes
+        reachability at a fixed grasp point -- leaning the tool swings the
+        flange through several centimetres.
+        """
+        reach = float(self.node.p("reach_radius_m"))
+        if reach <= 0.0:
+            return True
+
+        flange = flange_position(position, quaternion, self.node.tool_length())
+        distance = float(np.linalg.norm(flange))
+        fraction = distance / reach
+
+        if fraction > 1.0:
+            self.log.error(
+                f"{label} pose needs the flange at {distance:.3f} m, beyond the "
+                f"arm's {reach:.3f} m reach -- expect MoveIt error -31. "
+                "Spawn the die closer to the base, or lower grasp_tilt_deg."
+            )
+            return False
+        if fraction > float(self.node.p("reach_warn_fraction")):
+            self.log.warn(
+                f"{label} pose puts the flange at {distance:.3f} m, "
+                f"{100.0 * fraction:.0f}% of the arm's {reach:.3f} m reach; "
+                "IK may fail or take the long way round"
+            )
+        return True
+
     # -- one re-grasp ------------------------------------------------------ #
 
     def execute_regrasp(self, move: Regrasp) -> bool:
@@ -531,13 +607,28 @@ class DiceChallenge:
         )
 
         grasp_point = die_center.copy()
-        above = grasp_point + approach_offset(quaternion, approach)
+        # Stand off **straight up**, not back along the tool axis.
+        #
+        # Backing off along a leaning tool axis is the textbook approach -- it
+        # slides the fingers on along their own length -- but it also swings the
+        # flange outward, and on a UR5e reaching across the board there is no
+        # room for that. At this die position it puts the flange at 0.847 m of
+        # the arm's 0.850 m reach, and IK simply fails (MoveIt error -31, "no IK
+        # solution", on the free-space move before the gripper has gone
+        # anywhere). Straight up costs 0.789 m and plans immediately.
+        #
+        # Nothing is lost by going up instead: the open fingers straddle the die
+        # along the grasp axis, so a vertical descent never touches it however
+        # far the gripper leans.
+        above = grasp_point + np.array([0.0, 0.0, approach])
 
         self.log.info(
             f"grasping at ({grasp_point[0]:.3f}, {grasp_point[1]:.3f}, "
             f"{grasp_point[2]:.3f}), yaw {math.degrees(die_yaw):.1f} deg, "
             f"lean {math.degrees(tilt):+.0f} deg, {move}"
         )
+        self.warn_if_near_reach_limit("grasp", grasp_point, quaternion)
+        self.warn_if_near_reach_limit("pre-grasp", above, quaternion)
 
         # Lift before turning.  Turning at table height is how you drive a
         # corner of the die into the board -- the failure the hands-on slides
@@ -549,7 +640,9 @@ class DiceChallenge:
         # Put it back down where it came from, a hair above the board so the die
         # drops the last fraction of a millimetre instead of being pressed.
         place = np.array([die_center[0], die_center[1], die_center[2] + clearance])
-        retreat = place + approach_offset(turned_quaternion, approach)
+        retreat = place + np.array([0.0, 0.0, approach])
+        self.warn_if_near_reach_limit("turn", turned_position, turned_quaternion)
+        self.warn_if_near_reach_limit("place", place, turned_quaternion)
 
         # The cycle splits at the two points where the gripper acts; each piece
         # is a path the robot can run without stopping.

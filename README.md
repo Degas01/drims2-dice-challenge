@@ -378,6 +378,35 @@ tests pin this down — `test_a_leaning_grasp_is_never_horizontal_at_either_end`
 cannot come back unnoticed) and
 `test_leaning_does_not_move_the_fingers_off_their_faces`.
 
+### Reach is spent on orientation, not just position
+
+Leaning the gripper is not free, and the bill arrives somewhere unexpected. An
+arm's reach is quoted to its own **flange**; a 150 mm gripper is 150 mm the arm
+does not have. So at a *fixed* grasp point, changing the tool's orientation
+changes whether the pose is reachable at all — a 45° lean swings the flange
+through more than 10 cm.
+
+That bit the obvious stand-off. Backing off 10 cm *along the tool axis* is the
+textbook pre-grasp — it slides the fingers on along their own length — but with
+a lean it moves sideways as well as up, and sideways is the expensive direction:
+
+| pre-grasp, same grasp pose | flange distance | of a UR5e's 850 mm |
+| --- | --- | --- |
+| 10 cm back along the tool axis | 0.847 m | **100 %** |
+| 10 cm straight up | 0.789 m | 93 % |
+| (the grasp itself) | 0.767 m | 90 % |
+
+0.847 m is *nominally* inside the envelope and it still fails: at 99.6 %
+extension the elbow is straight and the arm is at a singularity. MoveIt reports
+it as `-31`, "no IK solution", on the free-space move — before the gripper has
+gone anywhere, so there is nothing to watch and nothing to debug.
+
+The stand-off is therefore **vertical**, which costs nothing: the open fingers
+straddle the die along the grasp axis, so a vertical descent never touches it
+however far the gripper leans. And because `-31` is so uninformative, the node
+now measures the flange distance for every pose it is about to command and says
+which one is out of range, in metres, before asking MoveIt.
+
 Two smaller motion fixes came with it:
 
 * **The wrist no longer takes the long way round.** A grasp and the same grasp
@@ -466,7 +495,7 @@ and direction, sensor noise and JPEG quality.
 | PnP yaw error | **1.4° median, 5.0° p95** |
 | Undistortion vs OpenCV run to convergence | **agrees to 1e-9** |
 | Cycle time, blended vs stop-at-every-waypoint | **5.61 s vs 7.37 s (−24 %)** |
-| Test count | **336 passing** |
+| Test count | **341 passing** |
 
 Position error is measured end to end: detect the die, self-calibrate the
 homography from the board corners, back-project with the parallax correction,
@@ -504,7 +533,7 @@ src/dice_task/
   dice_task/trajectory.py             LIN path, trapezoidal profile, SLERP, blending (no ROS)
   dice_task/cartesian_executor.py     sample → IK → JointTrajectory          (no ROS)
   dice_task/dice_task_node.py         the state machine
-tests/                                336 tests, all offline
+tests/                                341 tests, all offline
 scripts/make_docs_images.py           regenerates every figure in this README
 ```
 
@@ -758,6 +787,8 @@ ros2 launch dice_task dice_challenge.launch.py \
 | `dice_task/gripper_close_axis` | `y` | Which **tool** axis the fingers close along. Wrong value ⇒ the die is grabbed on its corners. Quote it: YAML 1.1 reads a bare `y` as `true`. |
 | `dice_task/grasp_tilt_deg` | `45` | How far the gripper leans off vertical to grasp. `0` restores a straight-down grasp, which **cannot put the die back down** after a 90° flip — see [Putting the die back down](#putting-the-die-back-down). |
 | `dice_task/lift_height_m` | `0.12` | Lift before turning; too small clips the board. |
+| `dice_task/reach_radius_m` | `0.850` | The arm's reach *to its flange*. Diagnostics only — turns MoveIt's `-31` into a message naming the pose and the distance. `0` disables. |
+| `dice_task/tool_length_m` | `0.15` | Flange to fingertips. Read from TF when available; this is the fallback. |
 | `dice_vision/board_origin_in_base` | `[0.60, 0.10, -0.01]` | Board centre in the base frame; Z is the cell's `surface_height`. |
 | `dice_vision/camera_height_m` | `1.0` | Only used for the parallax correction. |
 | `dice_vision/chroma_tolerance` | `0.055` | Raise if the die is being cut into pieces; lower if shadow leaks in. |
@@ -784,6 +815,7 @@ Integration problems hit while bringing this up on WSL2, and what they look like
 | Task node logs `cannot look up dice_tf: "base_link" ... does not exist` and drops to `deduce` | A TF listener only receives `/tf` while its node is being executed. | Fixed in `dice_task_node.main`: the node now runs in its own executor on a background thread, and `wait_for_tf` fails loudly instead of silently degrading. |
 | RViz shows the cell but no die | The spawner died — check terminal 2, not RViz. | As above. |
 | `Cartesian planner completed 0.75 of the trajectory` then `motion failed with MoveIt error 99999`, always on the *place* move after a clean pick | A 90° flip rotates the tool by the same 90° as the die, so a straight-down grasp finishes pointing horizontally — and a horizontal gripper cannot be lowered to the board, because its own body arrives first. 75 % of the descent is exactly where it gets to. | Fixed by `grasp_tilt_deg: 45`: lean −45° to pick up and +45° to put down, so the excursion is centred on vertical and neither end is horizontal. |
+| `motion failed with MoveIt error -31` on the *first* move, before the arm goes anywhere | `-31` is "no IK solution". Almost always reach: the die can sit most of a metre from the base and the gripper adds another 150 mm past the flange. | The node now prints the flange distance and which pose exceeded it. Spawn the die closer to the base, or lower `grasp_tilt_deg`. |
 | The wrist spins a half turn before touching the die | A grasp and the same grasp rolled 180° about its approach axis are equally valid, and the arm was handed whichever the maths produced first. | Fixed by `nearest_equivalent_grasp`, which reads the current tool orientation from TF and picks the nearer of the two. |
 | `ros2 pkg executables dice_vision` lists only `dice_vision_node` | The workspace was built before `fake_camera_node` existed. | `colcon build --packages-select dice_vision --symlink-install` and re-source `install/setup.bash`. |
 

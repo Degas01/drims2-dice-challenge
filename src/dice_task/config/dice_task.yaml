@@ -21,7 +21,12 @@ dice_task:
     # parameter type. Always quote single-letter axis names.
     gripper_close_axis: "y"   # which tool axis the fingers close along
 
-    dice_size_m: 0.027
+    # 30 mm: what drims_dice_simulator actually spawns ("size 0.03" in its log).
+    dice_size_m: 0.030
+    # dice_tf is published on the die's TOP FACE, not at its centre. The
+    # spawner's own log proves it: surface_height -0.020 plus size 0.030 puts
+    # the centre at -0.005, but the frame arrives at +0.011 -- half a die higher.
+    die_frame_on_top_face: true
     # How far the gripper leans off vertical to grasp, in degrees.
     #
     # A 90-degree flip rotates the tool by the same 90 degrees as the die, so a
@@ -47,8 +52,17 @@ dice_task:
     # ends of the flip clear of horizontal; below about 32 degrees the gripper
     # starts hitting the board again on the place. Set verify_ik_before_moving
     # false to skip the check and go straight for grasp_tilt_deg.
-    verify_ik_before_moving: true
+    # Straight down (0) is always appended as the last resort: it is the
+    # easiest orientation for the arm to hold and the only one certain to be
+    # reachable, at the price of finishing the flip horizontal -- which means
+    # the die is released from a few centimetres rather than set down.
     grasp_tilt_search_deg: [0.0, -7.0, 7.0, -13.0, 13.0]
+
+    # Gripper envelope, used to work out how low it can go at a given angle
+    # before its own body reaches the board.
+    gripper_body_radius_m: 0.045
+    gripper_body_offset_m: 0.05
+    gripper_body_length_m: 0.10
 
     # Diagnostics: the arm's reach to its own flange, and the fraction at which
     # to start warning. Used to turn "-31" into a message that names the pose.

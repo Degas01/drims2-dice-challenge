@@ -30,6 +30,8 @@ __all__ = [
     "nearest_equivalent_grasp",
     "approach_offset",
     "flange_position",
+    "lowest_gripper_offset",
+    "release_height",
     "rotate_about_axis",
     "AXIS_VECTORS",
 ]
@@ -253,6 +255,57 @@ def approach_offset(quaternion: Sequence[float], distance: float) -> np.ndarray:
     """
     approach = matrix_from_quaternion(quaternion)[:, 2]
     return -float(distance) * approach
+
+
+def lowest_gripper_offset(
+    quaternion: Sequence[float],
+    body_radius: float = 0.045,
+    body_offset: float = 0.05,
+    body_length: float = 0.10,
+) -> float:
+    """How far below the tool tip the gripper's own body hangs, in metres.
+
+    Model the gripper as a cylinder of radius ``body_radius`` running from
+    ``body_offset`` to ``body_offset + body_length`` back along the approach
+    axis, with the fingertips at the tip itself.  The answer is negative when
+    some part of the gripper sits below the tip.
+
+    This is what decides whether the die can be *placed* or has to be
+    *released*.  Pointing straight down the body is directly above the tip and
+    the answer is 0 -- the die can go all the way to the board.  Pointing
+    horizontally, the body sweeps a full radius below the tip, and trying to
+    lower the die to the board drives the gripper into it: MoveIt gets three
+    quarters of the way down, stops, and reports 99999.
+    """
+    approach_z = float(np.asarray(matrix_from_quaternion(quaternion))[2, 2])
+    # Vertical half-extent of the cylinder's cross-section.
+    radius_drop = float(body_radius) * float(np.sqrt(max(0.0, 1.0 - approach_z**2)))
+    near = -float(body_offset) * approach_z - radius_drop
+    far = -float(body_offset + body_length) * approach_z - radius_drop
+    return min(0.0, near, far)
+
+
+def release_height(
+    board_z: float,
+    die_centre_z: float,
+    quaternion: Sequence[float],
+    clearance: float = 0.004,
+    **gripper,
+) -> float:
+    """Lowest tool height that puts the die down without burying the gripper.
+
+    Returns the height for the *tool tip*.  Where the gripper allows it this is
+    the die's own resting height and the die is placed; where it does not, it is
+    as low as the gripper can go, and the die falls the rest of the way.
+
+    Dropping a die a few centimetres is not elegant, but it is what a parallel
+    jaw gripper leaves you after a 90-degree flip, and it is self-correcting:
+    the die lands flat on the face the turn selected, and if it does tumble the
+    next loop reads the new face and re-plans.
+    """
+    resting = float(die_centre_z) + float(clearance)
+    floor = float(board_z) + float(clearance) - lowest_gripper_offset(quaternion, **gripper)
+    return max(resting, floor)
 
 
 def flange_position(

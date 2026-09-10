@@ -71,6 +71,7 @@ from dice_task.grasping import (
     grasp_orientation,
     nearest_equivalent_grasp,
     normals_in_grasp_frame,
+    release_height,
     rotate_about_axis,
     tilt_for_turn,
     yaw_rotation,
@@ -169,7 +170,12 @@ class DiceTaskNode(Node):
             ),
         )
 
-        self.declare_parameter("dice_size_m", 0.027)
+        # 30 mm, matching what drims_dice_simulator actually spawns (its log
+        # says "size 0.03"); the DRIMS default config says 27 mm.
+        self.declare_parameter("dice_size_m", 0.030)
+        # dice_tf is published on the die's top face, not at its centre -- see
+        # lookup_die_pose, which measures the offset from the spawner's own numbers.
+        self.declare_parameter("die_frame_on_top_face", True)
         # How far the gripper leans off vertical to grasp, in degrees.  45 puts
         # the 90-degree flip symmetrically either side of vertical so neither
         # end of it is horizontal; 0 restores the old straight-down grasp, which
@@ -184,9 +190,15 @@ class DiceTaskNode(Node):
         # and try nearby leans and both wrist rolls until one solves. Costs four
         # quick IK calls in the normal case; without it an unreachable
         # orientation is only discovered as MoveIt error -31 mid-cycle.
-        self.declare_parameter("verify_ik_before_moving", True)
-        # Offsets from grasp_tilt_deg to try, in order of preference.
+        # Offsets from grasp_tilt_deg to try, in order of preference. Straight
+        # down is always appended as the fallback that is certain to be
+        # reachable, so the arm always moves even when every lean is refused.
         self.declare_parameter("grasp_tilt_search_deg", [0.0, -7.0, 7.0, -13.0, 13.0])
+        # Gripper envelope, used to work out how low it can go at a given angle
+        # before its own body reaches the board.
+        self.declare_parameter("gripper_body_radius_m", 0.045)
+        self.declare_parameter("gripper_body_offset_m", 0.05)
+        self.declare_parameter("gripper_body_length_m", 0.10)
         # Flange to fingertips; read from TF when available, this is the fallback.
         self.declare_parameter("tool_length_m", 0.15)
         self.declare_parameter("approach_height_m", 0.10)
@@ -386,7 +398,17 @@ class DiceTaskNode(Node):
         # square and only its face directions matter for grasping.
         yaw = float(math.atan2(rot[1, 0], rot[0, 0]))
         yaw = (yaw + math.pi / 4) % (math.pi / 2) - math.pi / 4
-        return np.array([t.x, t.y, t.z]), yaw
+
+        # ``dice_tf`` sits on the die's **top face**, not at its centre.
+        #
+        # Worth checking rather than assuming, and the simulator's own log gives
+        # the numbers: it reports surface_height -0.020 and size 0.030, so the
+        # centre is at -0.005 in base_link -- but the frame comes back at +0.011,
+        # which is half a die higher. Grasping at the frame therefore closes the
+        # fingers on the top edge, and every height derived from it -- lift,
+        # place, board clearance -- is off by the same 15 mm.
+        offset = 0.5 * float(self.p("dice_size_m")) if self.p("die_frame_on_top_face") else 0.0
+        return np.array([t.x, t.y, t.z - offset]), yaw
 
 
 def _matrix_from_quaternion(q) -> np.ndarray:
@@ -576,140 +598,67 @@ class DiceChallenge:
             )
         return True
 
-    # -- choosing a grasp the arm can actually hold ------------------------- #
+    # -- choosing a lean the arm will accept -------------------------------- #
 
-    def reachable(self, position, quaternion) -> bool:
-        """Ask easy_motion's IK whether this pose has a solution at all."""
-        return self._solve_ik(position, quaternion, seed=None) is not None
+    def lean_candidates(self) -> List[float]:
+        """Leans to try, in order of preference, ending with straight down.
 
-    def choose_grasp(self, move: Regrasp, die_center, die_yaw: float, close_axis: str):
-        """Pick a lean and a wrist roll that the arm can reach, not just the ideal one.
-
-        45 degrees is the *geometric* optimum -- it centres the flip's
-        90-degree excursion on vertical, so neither end is horizontal. It is not
-        automatically an *achievable* orientation. On this cell it was not: IK
-        ground for three seconds a time and gave up with -31, three attempts in
-        a row, before the arm had moved at all.
-
-        Reach was not the problem (the flange check passed), and neither was
-        geometry. A six-axis arm simply cannot hold every orientation at every
-        point, and a UR5e reaching across the board has its wrist close to a
-        singularity where whole families of orientations drop out.
-
-        So this searches instead of assuming, over two freedoms that cost
-        nothing to vary:
-
-        * **the lean**, from the ideal outwards -- 45, then 38, 52, 32, 58.
-          Every one of them keeps both ends of the flip clear of horizontal,
-          which is the property that matters; the exact angle does not.
-        * **the wrist roll**, both of the two 180-degree-apart grasps that grip
-          the same faces from the same side. These are genuinely
-          interchangeable to the die and can be worlds apart for the wrist.
-
-        The first combination whose four critical poses all solve wins, and the
-        preferred one is tried first, so the normal case costs four quick IK
-        calls and no extra motion. Ordering matters: the wrist roll nearer the
-        arm's current pose comes first, so a working grasp is also a cheap one.
+        The listed offsets keep both ends of the flip clear of horizontal, which
+        is what lets the die be *placed*. Straight down is appended as the
+        guaranteed fallback: it is the easiest orientation for the arm to hold
+        and the only one certain to be reachable, at the price of finishing the
+        flip horizontal, which means the die is released rather than placed.
         """
         nominal = abs(float(self.node.p("grasp_tilt_deg")))
-        if not bool(self.node.p("verify_ik_before_moving")):
-            tilt = tilt_for_turn(move.quarter_turns, math.radians(nominal))
-            quaternion = grasp_orientation(move.axis, die_yaw, close_axis, tilt)
-            return tilt, nearest_equivalent_grasp(
-                quaternion, self.node.lookup_tool_orientation()
-            )
-
-        spread = [float(v) for v in self.node.p("grasp_tilt_search_deg")]
-        reference = self.node.lookup_tool_orientation()
-        attempted = []
-
-        for offset in spread:
+        angles = []
+        for offset in [float(v) for v in self.node.p("grasp_tilt_search_deg")]:
             angle = nominal + offset
-            if not 20.0 <= angle <= 70.0:
-                # Outside this band one end of the flip is close enough to
-                # horizontal to bring the gripper down onto the board again.
-                continue
+            if 20.0 <= angle <= 70.0 and angle not in angles:
+                angles.append(angle)
+        angles.append(0.0)
+        return angles
+
+    def approach_with_a_reachable_lean(
+        self, move: Regrasp, die_center, die_yaw: float, close_axis: str, velocity: float
+    ):
+        """Move to the pre-grasp, trying leans until the arm accepts one.
+
+        Returns ``(tilt, quaternion, above)``; ``quaternion`` is ``None`` when
+        every candidate was refused, which means the die is somewhere the arm
+        cannot work rather than the grasp being wrong.
+        """
+        approach = float(self.node.p("approach_height_m"))
+        above = np.asarray(die_center, dtype=float) + np.array([0.0, 0.0, approach])
+        reference = self.node.lookup_tool_orientation()
+        rejected = []
+
+        for angle in self.lean_candidates():
             tilt = tilt_for_turn(move.quarter_turns, math.radians(angle))
             base = grasp_orientation(move.axis, die_yaw, close_axis, tilt)
-            preferred = nearest_equivalent_grasp(base, reference)
-            rolls = [preferred]
-            other = flip_about_approach(preferred)
-            if not np.allclose(other, preferred):
+            # Two wrist rolls grip the same faces from the same side; the one
+            # nearer the arm's current pose costs less travel, so try it first.
+            rolls = [nearest_equivalent_grasp(base, reference)]
+            other = flip_about_approach(rolls[0])
+            if not np.allclose(other, rolls[0]):
                 rolls.append(other)
 
             for roll, quaternion in enumerate(rolls):
-                unreachable = self._first_unreachable(
-                    move, die_center, die_yaw, quaternion
-                )
-                if unreachable is None:
-                    if attempted:
+                self.warn_if_near_reach_limit("pre-grasp", above, quaternion)
+                if self._move(above, quaternion, cartesian=False, velocity=velocity):
+                    if rejected:
                         self.log.info(
-                            f"lean {angle:.0f} deg (roll {roll}) is reachable; "
-                            f"tried {', '.join(attempted)} first"
+                            f"lean {angle:.0f} deg accepted after "
+                            f"{', '.join(rejected)} were refused"
                         )
-                    return tilt, quaternion
-                attempted.append(f"{angle:.0f}deg/roll{roll}({unreachable})")
+                    return tilt, quaternion, above
+                rejected.append(f"{angle:.0f}deg/roll{roll}")
 
-        # Nothing solved. Say so clearly, then go anyway with the preferred
-        # grasp and let MoveIt deliver the verdict.
-        #
-        # Refusing to move would be the tidier-looking choice and the wrong one:
-        # this check is an *advisory* built on a separate IK service, and if that
-        # service is missing or answering badly, every candidate looks
-        # unreachable whether or not it is. A pre-flight check that can ground
-        # the robot on its own bad day is worse than no pre-flight check.
         self.log.error(
-            "no lean passed the IK check: "
-            f"{', '.join(attempted) if attempted else 'no candidates in range'}"
+            f"the arm refused every lean ({', '.join(rejected)}). The die is "
+            "somewhere it cannot work: try spawning it nearer the base, "
+            'position:="[-0.1, 0.58, -0.04]".'
         )
-        self.log.error(
-            "Either the die is somewhere the arm cannot work -- try spawning it "
-            "nearer the base, x around -0.1, y around 0.60 -- or the IK service "
-            "is not answering. Attempting the nominal grasp anyway; if MoveIt "
-            "also reports -31 then it is the former."
-        )
-        tilt = tilt_for_turn(move.quarter_turns, math.radians(nominal))
-        quaternion = grasp_orientation(move.axis, die_yaw, close_axis, tilt)
-        return tilt, nearest_equivalent_grasp(quaternion, reference)
-
-    def _first_unreachable(
-        self, move: Regrasp, die_center, die_yaw: float, quaternion
-    ) -> Optional[str]:
-        """Name the first pose of the cycle IK cannot solve, or ``None``."""
-        for label, position, orientation in self.cycle_poses(
-            move, die_center, die_yaw, quaternion
-        ):
-            if not self.warn_if_near_reach_limit(label, position, orientation):
-                return label
-            if not self.reachable(position, orientation):
-                return label
-        return None
-
-    def cycle_poses(self, move: Regrasp, die_center, die_yaw: float, quaternion):
-        """The four poses a re-grasp has to hit, in order.
-
-        Only these are checked. The intermediate lift and the retreat are
-        straight vertical moves between two poses already known to be good, so
-        if the ends solve the middle does too.
-        """
-        approach = float(self.node.p("approach_height_m"))
-        lift = float(self.node.p("lift_height_m"))
-        clearance = float(self.node.p("place_clearance_m"))
-
-        grasp_point = np.asarray(die_center, dtype=float)
-        above = grasp_point + np.array([0.0, 0.0, approach])
-        lifted = grasp_point + np.array([0.0, 0.0, lift])
-        turned_position, turned_quaternion = rotate_about_axis(
-            lifted, quaternion, move.axis, move.quarter_turns, lifted, die_yaw
-        )
-        place = np.array([die_center[0], die_center[1], die_center[2] + clearance])
-
-        return [
-            ("pre-grasp", above, quaternion),
-            ("grasp", grasp_point, quaternion),
-            ("turn", turned_position, turned_quaternion),
-            ("place", place, turned_quaternion),
-        ]
+        return 0.0, None, above
 
     # -- one re-grasp ------------------------------------------------------ #
 
@@ -740,9 +689,19 @@ class DiceChallenge:
         # can be set down instead of dropped.
         #
         # *Which* lean, though, is not ours to decide alone: 45 degrees is the
-        # geometric optimum and the arm may simply not be able to hold it. So
-        # ask, rather than assume -- see choose_grasp.
-        tilt, quaternion = self.choose_grasp(move, die_center, die_yaw, close_axis)
+        # geometric optimum and the arm may simply not be able to hold it. On
+        # this cell it could not -- IK ground for three seconds a time and gave
+        # up with -31, three attempts, before the arm had moved at all.
+        #
+        # So try the leans in order and let the *arm* decide, by attempting the
+        # free-space approach move for each until one is accepted. An earlier
+        # version asked easy_motion's get_ik instead, which was quicker and
+        # useless: get_ik happily solved a pose that move_to_pose then refused,
+        # so the check passed everything and rejected nothing. The only oracle
+        # worth consulting is the one that will actually run the motion.
+        tilt, quaternion, above = self.approach_with_a_reachable_lean(
+            move, die_center, die_yaw, close_axis, fast
+        )
         if quaternion is None:
             return False
 
@@ -775,9 +734,38 @@ class DiceChallenge:
         turned_position, turned_quaternion = rotate_about_axis(
             lifted, quaternion, move.axis, move.quarter_turns, lifted, die_yaw
         )
-        # Put it back down where it came from, a hair above the board so the die
-        # drops the last fraction of a millimetre instead of being pressed.
-        place = np.array([die_center[0], die_center[1], die_center[2] + clearance])
+        # Put it back down where it came from -- as low as the *gripper* allows,
+        # which is not always as low as the die would like.
+        #
+        # Straight down, the gripper body is directly above the tool and the die
+        # can be set on the board. After a flip taken from straight down the
+        # gripper points sideways, its body sweeps a radius below the tool, and
+        # asking for the board drives the gripper into it: that is the 99999,
+        # with the Cartesian planner stopping three quarters of the way down.
+        #
+        # So compute the lowest height the gripper can actually reach and
+        # release there. The die falls the remainder. Inelegant, and exactly
+        # what a parallel jaw gripper leaves you after a 90-degree flip -- but
+        # self-correcting, because it lands flat on the face the turn chose and
+        # the next loop re-reads it either way.
+        die_size = float(self.node.p("dice_size_m"))
+        board_z = die_center[2] - 0.5 * die_size
+        place_z = release_height(
+            board_z,
+            float(die_center[2]),
+            turned_quaternion,
+            clearance=clearance,
+            body_radius=float(self.node.p("gripper_body_radius_m")),
+            body_offset=float(self.node.p("gripper_body_offset_m")),
+            body_length=float(self.node.p("gripper_body_length_m")),
+        )
+        place = np.array([die_center[0], die_center[1], place_z])
+        drop = place_z - (die_center[2] + clearance)
+        if drop > 1e-4:
+            self.log.info(
+                f"gripper cannot reach the board at this angle; releasing "
+                f"{drop * 1000:.0f} mm above the die's resting height"
+            )
         retreat = place + np.array([0.0, 0.0, approach])
 
         # The cycle splits at the two points where the gripper acts; each piece
@@ -791,11 +779,7 @@ class DiceChallenge:
         ]
         retreat_path = [(place, turned_quaternion), (retreat, turned_quaternion)]
 
-        # Getting *to* the start of the cycle is a free-space move; plan it with
-        # MoveIt either way, so the arm avoids the cell on the way in.
-        if not self._move(above, quaternion, cartesian=False, velocity=fast):
-            return False
-
+        # The move to `above` already happened, inside the lean search.
         trajectory_mode = str(self.node.p("motion_mode")).lower() == "trajectory"
 
         def run(path, fallback_speeds) -> bool:

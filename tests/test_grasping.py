@@ -9,6 +9,8 @@ from dice_task.grasping import (
     approach_offset,
     flange_position,
     flip_about_approach,
+    lowest_gripper_offset,
+    release_height,
     grasp_orientation,
     nearest_equivalent_grasp,
     matrix_from_quaternion,
@@ -448,3 +450,58 @@ def test_the_grasp_itself_stays_well_inside_the_reach_at_every_lean():
 def test_flange_position_is_the_tip_for_a_zero_length_tool():
     quaternion = grasp_orientation("x", 0.3, "y", -TILT)
     assert np.allclose(flange_position(DIE_IN_BASE, quaternion, 0.0), DIE_IN_BASE)
+
+
+# --------------------------------------------------------------------------- #
+# Putting the die down: place if the gripper allows, release if it does not
+# --------------------------------------------------------------------------- #
+
+BOARD_Z = -0.019
+DIE_CENTRE_Z = -0.004
+
+
+def _post_turn(angle_deg, turns=1, axis="x"):
+    tilt = tilt_for_turn(turns, np.deg2rad(angle_deg))
+    quaternion = grasp_orientation(axis, DIE_YAW, "y", tilt)
+    pivot = np.array([-0.1, 0.65, 0.12])
+    _, finish = rotate_about_axis(pivot, quaternion, axis, turns, pivot, DIE_YAW)
+    return finish
+
+
+def test_a_downward_gripper_hangs_nothing_below_its_own_tip():
+    straight_down = grasp_orientation("x", DIE_YAW, "y", 0.0)
+    assert lowest_gripper_offset(straight_down) == pytest.approx(0.0)
+
+
+def test_a_horizontal_gripper_hangs_a_full_radius_below_its_tip():
+    """This is the 99999: the body reaches the board before the die does."""
+    horizontal = _post_turn(0.0)
+    assert lowest_gripper_offset(horizontal, body_radius=0.045) == pytest.approx(-0.045)
+
+
+def test_the_further_it_leans_the_further_the_body_hangs():
+    offsets = [lowest_gripper_offset(_post_turn(a)) for a in (45.0, 38.0, 32.0, 20.0, 0.0)]
+    assert offsets == sorted(offsets, reverse=True)
+
+
+def test_a_leaning_grasp_can_set_the_die_down_but_a_flat_one_must_drop_it():
+    resting = DIE_CENTRE_Z + 0.004
+
+    leaning = release_height(BOARD_Z, DIE_CENTRE_Z, _post_turn(45.0), clearance=0.004)
+    assert leaning == pytest.approx(resting), "a 45 degree lean should place, not drop"
+
+    flat = release_height(BOARD_Z, DIE_CENTRE_Z, _post_turn(0.0), clearance=0.004)
+    assert flat > resting + 0.02, "a flat grasp has to release the die from above"
+
+
+def test_the_release_never_puts_the_gripper_through_the_board():
+    for angle in (0.0, 20.0, 32.0, 45.0, 58.0):
+        finish = _post_turn(angle)
+        z = release_height(BOARD_Z, DIE_CENTRE_Z, finish, clearance=0.004)
+        assert z + lowest_gripper_offset(finish) >= BOARD_Z - 1e-9, f"lean {angle} digs in"
+
+
+def test_the_release_is_never_below_the_die_resting_height():
+    for angle in (0.0, 32.0, 45.0):
+        z = release_height(BOARD_Z, DIE_CENTRE_Z, _post_turn(angle), clearance=0.004)
+        assert z >= DIE_CENTRE_Z + 0.004 - 1e-9

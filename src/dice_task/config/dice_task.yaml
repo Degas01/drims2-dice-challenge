@@ -36,6 +36,26 @@ dice_task:
     # horizontal. The fingers close along the same axis whatever the lean, so
     # they still land flat on the same two faces.
     grasp_tilt_deg: 45.0
+
+    # 45 is the geometric optimum, not necessarily an orientation the arm can
+    # hold: a six-axis arm reaching across the board has its wrist near a
+    # singularity, where whole families of orientations have no IK solution.
+    # That shows up as MoveIt error -31 with the arm still parked at home.
+    #
+    # So the node asks IK first, trying these offsets from grasp_tilt_deg in
+    # order, and both wrist rolls for each. Every angle in the list keeps both
+    # ends of the flip clear of horizontal; below about 32 degrees the gripper
+    # starts hitting the board again on the place. Set verify_ik_before_moving
+    # false to skip the check and go straight for grasp_tilt_deg.
+    verify_ik_before_moving: true
+    grasp_tilt_search_deg: [0.0, -7.0, 7.0, -13.0, 13.0]
+
+    # Diagnostics: the arm's reach to its own flange, and the fraction at which
+    # to start warning. Used to turn "-31" into a message that names the pose.
+    reach_radius_m: 0.850
+    reach_warn_fraction: 0.92
+    tool_length_m: 0.15        # flange to fingertips; read from TF when available
+
     approach_height_m: 0.10
     lift_height_m: 0.12
     place_clearance_m: 0.004

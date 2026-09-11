@@ -26,7 +26,13 @@ dice_task:
     # dice_tf is published on the die's TOP FACE, not at its centre. The
     # spawner's own log proves it: surface_height -0.020 plus size 0.030 puts
     # the centre at -0.005, but the frame arrives at +0.011 -- half a die higher.
-    die_frame_on_top_face: true
+    #
+    # Correcting for it is still wrong *in simulation*, and not for geometric
+    # reasons: the die is a collision object, so putting the tool tip inside that
+    # box makes MoveIt refuse the descent with 99999 in under 200 ms. Keep 0 here
+    # and grasp the frame the simulator publishes. On real hardware, where there
+    # is no planning scene to object, 0.015 is the physically right value.
+    grasp_depth_below_die_frame_m: 0.0
     # How far the gripper leans off vertical to grasp, in degrees.
     #
     # A 90-degree flip rotates the tool by the same 90 degrees as the die, so a
@@ -47,11 +53,11 @@ dice_task:
     # singularity, where whole families of orientations have no IK solution.
     # That shows up as MoveIt error -31 with the arm still parked at home.
     #
-    # So the node asks IK first, trying these offsets from grasp_tilt_deg in
-    # order, and both wrist rolls for each. Every angle in the list keeps both
-    # ends of the flip clear of horizontal; below about 32 degrees the gripper
-    # starts hitting the board again on the place. Set verify_ik_before_moving
-    # false to skip the check and go straight for grasp_tilt_deg.
+    # So the node tries these offsets from grasp_tilt_deg in order, each as a
+    # real approach move, with both wrist rolls and every equally good turn the
+    # planner offers. Every angle listed keeps both ends of the flip clear of
+    # horizontal; below about 32 degrees the gripper starts hitting the board
+    # again on the place.
     # Straight down (0) is always appended as the last resort: it is the
     # easiest orientation for the arm to hold and the only one certain to be
     # reachable, at the price of finishing the flip horizontal -- which means

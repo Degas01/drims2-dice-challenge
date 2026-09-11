@@ -5,7 +5,7 @@ the interesting work was in the gap between "the tests pass" and "the robot
 moved."
 
 The perception and planning modules were written test-first and were correct
-before they ever met the simulator — 347 offline tests, exhaustive over all 24
+before they ever met the simulator — 355 offline tests, exhaustive over all 24
 die orientations and all 8 die colours. That bought a lot, and it bought nothing
 at all against the second half of this list. Every failure below survived a green
 test suite, and most were only visible with the whole cell running.
@@ -243,6 +243,34 @@ instead of a number.
 
 ---
 
+### Reachability as a first-class input
+
+The last fix is the only one that changed the *architecture* rather than a
+number, so it is worth stating separately.
+
+Every earlier attempt treated the planner's output as fixed and tried to make the
+arm accept it. The planner chooses a turn, the executor works out a grasp, and if
+the arm refuses, the cycle fails. But the planner's choice is frequently
+arbitrary — four different routes reach the bottom face, and the deductive
+policy's probe turn can be *any* of the four primitives, since with the sides
+indistinguishable all are equally informative.
+
+Throwing that arbitrariness away was the mistake. `equivalent_first_moves` and
+`DeductivePolicy.options` now surface it, the executor tries the alternatives
+when a grasp is refused, and `DeductivePolicy.substitute` tells the policy which
+route was actually taken so its deduced model of the die stays true.
+
+The ordering of the search encodes a real trade-off: lean, then alternative turn,
+then wrist roll. A lean of 32° or more lets the die be *placed* while straight
+down forces it to be *dropped*, so a good lean is worth more than the preferred
+turn.
+
+And where strict equivalence offers nothing — a side-face target has exactly one
+shortest route — the search may take a route one turn longer. Paying an extra
+re-grasp beats not moving. Tests pin both the equivalence and the bound: always
+taking the least-preferred option still reaches the target from every start and
+costs at most one extra re-grasp.
+
 ## What the failures have in common
 
 Three of the six field bugs were **diagnostic** failures rather than logic
@@ -277,12 +305,10 @@ Honest list, so the README's claims stay bounded.
   real cell after that.
 * **No LabVIEW sensor/actuator integration** for the gripper — that part of the
   school's brief needs the physical cell.
-* **The workspace limitation is documented, not solved.** A real fix would plan
-  the *pick position* as well as the grasp: move the die to a friendlier part of
-  the board first, or choose among equally valid re-grasp moves by reachability.
-  The deductive policy makes this easy in principle — its probe turn can be about
-  either axis in either direction, and all four are equally informative — but the
-  plumbing to feed reachability back into move selection is not written.
+* **The workspace limitation is mitigated, not eliminated.** Choosing among
+  equally good re-grasps by reachability *is* now written — see "Reachability as
+  a first-class input" below — but nothing moves the die to a friendlier part of
+  the board when no grasp at its current position works.
 * **One die per board.** The detector returns the single most die-like blob. The
   course's multi-dice photo would need the scorer turned into a ranked list; the
   pipeline supports it, the service signature does not.

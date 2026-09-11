@@ -36,7 +36,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import rclpy
@@ -55,8 +55,10 @@ from dice_task.die_model import (
     DeductivePolicy,
     Regrasp,
     describe_plan,
+    equivalent_first_moves,
     opposite,
-    plan_from_normals,
+    orientation_from_normals,
+    plan_exact,
 )
 from dice_task.cartesian_executor import (
     estimate_joint_velocities,
@@ -186,6 +188,12 @@ class DiceTaskNode(Node):
         # which pose was out of range and by how much. Set 0 to disable.
         self.declare_parameter("reach_radius_m", 0.850)
         self.declare_parameter("reach_warn_fraction", 0.92)
+        # Ceiling on refused grasps per re-grasp before the cycle gives up.
+        self.declare_parameter("max_grasp_attempts", 8)
+        # How many turns longer than necessary a fallback route may be. 1 opens
+        # up alternatives for a side-face target, which has only one shortest
+        # move and therefore no free alternative at all.
+        self.declare_parameter("extra_moves_when_stuck", 1)
         # Ask IK whether a grasp is achievable before committing the arm to it,
         # and try nearby leans and both wrist rolls until one solves. Costs four
         # quick IK calls in the normal case; without it an unreachable
@@ -618,55 +626,93 @@ class DiceChallenge:
         angles.append(0.0)
         return angles
 
-    def approach_with_a_reachable_lean(
-        self, move: Regrasp, die_center, die_yaw: float, close_axis: str, velocity: float
+    def approach_with_a_reachable_grasp(
+        self,
+        moves: List[Regrasp],
+        die_center,
+        die_yaw: float,
+        close_axis: str,
+        velocity: float,
     ):
-        """Move to the pre-grasp, trying leans until the arm accepts one.
+        """Move to the pre-grasp, trying grasps until the arm accepts one.
 
-        Returns ``(tilt, quaternion, above)``; ``quaternion`` is ``None`` when
-        every candidate was refused, which means the die is somewhere the arm
-        cannot work rather than the grasp being wrong.
+        Returns ``(move, tilt, quaternion, above)``; ``quaternion`` is ``None``
+        when every candidate was refused.
+
+        Three things vary, and the order they vary in is the whole design:
+
+        1. **the lean**, outermost-but-one, because a lean of 32 degrees or more
+           lets the die be *placed* while straight down forces it to be
+           *dropped*. Keeping a good lean is worth more than keeping the
+           preferred turn;
+        2. **the move**, within a lean, over the alternatives the planner says
+           are equally good -- a different turn means a different grasp axis and
+           so a different wrist orientation, which is exactly the freedom that a
+           near-singular arm needs;
+        3. **the wrist roll**, innermost, nearest-first, since both rolls grip
+           the same faces from the same side and the nearer one costs less
+           travel.
+
+        Each candidate is judged by *attempting the real approach move*. An
+        earlier version asked ``get_ik`` instead, which was faster and useless:
+        it solved poses that ``move_to_pose`` then refused, so the check passed
+        everything and rejected nothing. The only oracle worth consulting is the
+        one that will run the motion.
         """
         approach = float(self.node.p("approach_height_m"))
         above = np.asarray(die_center, dtype=float) + np.array([0.0, 0.0, approach])
         reference = self.node.lookup_tool_orientation()
-        rejected = []
+        budget = int(self.node.p("max_grasp_attempts"))
+        rejected: List[str] = []
 
         for angle in self.lean_candidates():
-            tilt = tilt_for_turn(move.quarter_turns, math.radians(angle))
-            base = grasp_orientation(move.axis, die_yaw, close_axis, tilt)
-            # Two wrist rolls grip the same faces from the same side; the one
-            # nearer the arm's current pose costs less travel, so try it first.
-            rolls = [nearest_equivalent_grasp(base, reference)]
-            other = flip_about_approach(rolls[0])
-            if not np.allclose(other, rolls[0]):
-                rolls.append(other)
+            for move in moves:
+                tilt = tilt_for_turn(move.quarter_turns, math.radians(angle))
+                base = grasp_orientation(move.axis, die_yaw, close_axis, tilt)
+                rolls = [nearest_equivalent_grasp(base, reference)]
+                other = flip_about_approach(rolls[0])
+                if not np.allclose(other, rolls[0]):
+                    rolls.append(other)
 
-            for roll, quaternion in enumerate(rolls):
-                self.warn_if_near_reach_limit("pre-grasp", above, quaternion)
-                if self._move(above, quaternion, cartesian=False, velocity=velocity):
-                    if rejected:
-                        self.log.info(
-                            f"lean {angle:.0f} deg accepted after "
-                            f"{', '.join(rejected)} were refused"
+                for roll, quaternion in enumerate(rolls):
+                    if len(rejected) >= budget:
+                        self.log.error(
+                            f"giving up after {budget} refused grasps "
+                            f"({', '.join(rejected)}); raise max_grasp_attempts "
+                            "to let it keep trying"
                         )
-                    return tilt, quaternion, above
-                rejected.append(f"{angle:.0f}deg/roll{roll}")
+                        return None, 0.0, None, above
+
+                    self.warn_if_near_reach_limit("pre-grasp", above, quaternion)
+                    if self._move(above, quaternion, cartesian=False, velocity=velocity):
+                        if rejected:
+                            self.log.info(
+                                f"{move} at lean {angle:.0f} deg accepted after "
+                                f"{len(rejected)} refused: {', '.join(rejected)}"
+                            )
+                        return move, tilt, quaternion, above
+                    rejected.append(f"{move.axis}{move.quarter_turns:+d}@{angle:.0f}/r{roll}")
 
         self.log.error(
-            f"the arm refused every lean ({', '.join(rejected)}). The die is "
+            f"the arm refused every grasp ({', '.join(rejected)}). The die is "
             "somewhere it cannot work: try spawning it nearer the base, "
             'position:="[-0.1, 0.58, -0.04]".'
         )
-        return 0.0, None, above
+        return None, 0.0, None, above
 
     # -- one re-grasp ------------------------------------------------------ #
 
-    def execute_regrasp(self, move: Regrasp) -> bool:
-        """Pick the die, turn it 90 degrees about ``move.axis``, put it down."""
+    def execute_regrasp(self, move: Regrasp, alternatives: Sequence[Regrasp] = ()):
+        """Pick the die, turn it 90 degrees, put it down.
+
+        ``alternatives`` are turns the planner considers just as good. They are
+        used only if the arm refuses the grasp for ``move``. Returns
+        ``(succeeded, move_actually_made)`` -- the caller needs the second value
+        to keep its model of the die honest.
+        """
         pose = self.node.lookup_die_pose()
         if pose is None:
-            return False
+            return False, None
         die_center, die_yaw = pose
 
         approach = float(self.node.p("approach_height_m"))
@@ -699,11 +745,13 @@ class DiceChallenge:
         # useless: get_ik happily solved a pose that move_to_pose then refused,
         # so the check passed everything and rejected nothing. The only oracle
         # worth consulting is the one that will actually run the motion.
-        tilt, quaternion, above = self.approach_with_a_reachable_lean(
-            move, die_center, die_yaw, close_axis, fast
+        used, tilt, quaternion, above = self.approach_with_a_reachable_grasp(
+            [move] + [m for m in alternatives if m != move],
+            die_center, die_yaw, close_axis, fast,
         )
         if quaternion is None:
-            return False
+            return False, None
+        move = used
 
         grasp_point = die_center.copy()
         # Stand off **straight up**, not back along the tool axis.
@@ -793,7 +841,7 @@ class DiceChallenge:
             return True
 
         if not run(approach_path, [(True, slow)]):
-            return False
+            return False, move
 
         self.close_gripper()
         self.motion.attach_object(
@@ -802,7 +850,7 @@ class DiceChallenge:
 
         if not run(carry_path, [(True, slow), (False, fast), (True, slow)]):
             self._abort_grasp()
-            return False
+            return False, move
 
         self.open_gripper()
         self.motion.detach_object(str(self.node.p("attached_object_id")))
@@ -810,7 +858,7 @@ class DiceChallenge:
         run(retreat_path, [(True, slow)])
 
         time.sleep(float(self.node.p("settle_seconds")))
-        return True
+        return True, move
 
     def _abort_grasp(self) -> None:
         self.log.warn("aborting grasp: releasing the die")
@@ -852,17 +900,28 @@ class DiceChallenge:
                 report.final_face = face
                 break
 
-            move, used = self._next_move(face, target, strategy, policy)
+            move, alternatives, used = self._next_move(face, target, strategy, policy)
             if move is None:
                 self.log.error("no move available; giving up")
                 report.attempts.append(Attempt(index, face, None, used, 0.0, False))
                 break
             if used == "deduce" and policy is None:
                 policy = self._policy
-            self.log.info(f"plan: {describe_plan([move])} [{used}]")
+            self.log.info(
+                f"plan: {describe_plan([move])} [{used}]"
+                + (f", or {len(alternatives) - 1} equally good alternative(s)"
+                   if len(alternatives) > 1 else "")
+            )
 
             step_started = time.monotonic()
-            done = self.execute_regrasp(move)
+            done, made = self.execute_regrasp(move, alternatives)
+            if made is not None and made != move:
+                # The arm chose a different route; tell the policy, or its model
+                # of the die silently stops matching the die.
+                self.log.info(f"the arm took {made} instead of {move}")
+                if policy is not None:
+                    policy.substitute(made)
+                move = made
             attempt = Attempt(index, face, move, used, time.monotonic() - step_started, done)
             report.attempts.append(attempt)
             if not done:
@@ -880,8 +939,12 @@ class DiceChallenge:
 
     def _next_move(
         self, face: int, target: int, strategy: str, policy: Optional[DeductivePolicy]
-    ) -> Tuple[Optional[Regrasp], str]:
-        """Pick the next re-grasp, preferring the exact planner when possible.
+    ) -> Tuple[Optional[Regrasp], List[Regrasp], str]:
+        """Pick the next re-grasp, and the alternatives that are just as good.
+
+        Returns ``(preferred, options, strategy_used)``. ``options`` starts with
+        the preferred move; the rest are routes the arm may fall back to when it
+        cannot reach the grasp the preferred one implies.
 
         ``strategy`` is one of:
 
@@ -894,17 +957,27 @@ class DiceChallenge:
         ``auto``
             ``exact`` when the face frames are published, ``deduce`` otherwise.
         """
+        extra = int(self.node.p("extra_moves_when_stuck"))
+
         if strategy in ("auto", "exact"):
             normals = self.node.face_normals_in_base()
             pose = self.node.lookup_die_pose()
             if normals is not None and pose is not None:
                 _, die_yaw = pose
-                plan = plan_from_normals(normals_in_grasp_frame(normals, die_yaw), target)
+                orientation = orientation_from_normals(
+                    normals_in_grasp_frame(normals, die_yaw)
+                )
+                plan = plan_exact(orientation, target)
                 if plan:
-                    return plan[0], "exact"
+                    # Shortest routes first, then ones a turn longer, so the arm
+                    # only pays for an extra re-grasp if it has to.
+                    options = equivalent_first_moves(orientation, target, extra)
+                    if plan[0] in options:
+                        options.remove(plan[0])
+                    return plan[0], [plan[0]] + options, "exact"
             if strategy == "exact":
                 self.log.error("face frames unavailable and strategy is 'exact'")
-                return None, "exact"
+                return None, [], "exact"
             self.log.info("face frames unavailable; deducing from the top face alone")
 
         if policy is None:
@@ -912,7 +985,7 @@ class DiceChallenge:
             self._policy = policy
         move = policy.observe(face)
         self.log.info(f"reasoning: {policy.reasoning}")
-        return move, "deduce"
+        return move, policy.options(extra), "deduce"
 
 
 def main(args=None) -> None:

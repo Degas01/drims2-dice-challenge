@@ -13,6 +13,7 @@ from dice_task.die_model import (
     PRIMITIVES,
     DeductivePolicy,
     Regrasp,
+    equivalent_first_moves,
     apply,
     face_towards,
     opposite,
@@ -338,3 +339,114 @@ def test_opposite_signs_cancel():
         for axis in ("x", "y"):
             state = apply(apply(rot, Regrasp(axis, 1)), Regrasp(axis, -1))
             assert np.allclose(state, rot)
+
+
+# --------------------------------------------------------------------------- #
+# Alternative routes, for when the arm cannot reach the preferred grasp
+# --------------------------------------------------------------------------- #
+
+
+def _plan_length_after(orientation, move, target):
+    nxt = apply(orientation, move)
+    return 1 if up_face(nxt) == target else 1 + len(plan_exact(nxt, target))
+
+
+def test_every_offered_alternative_is_genuinely_no_longer():
+    for extra in (0, 1, 2):
+        for rot in all_orientations():
+            for target in range(1, 7):
+                limit = len(plan_exact(rot, target)) + extra
+                for move in equivalent_first_moves(rot, target, extra):
+                    assert _plan_length_after(rot, move, target) <= limit
+
+
+def test_alternatives_are_offered_shortest_first():
+    for rot in all_orientations():
+        for target in range(1, 7):
+            options = equivalent_first_moves(rot, target, extra_moves=2)
+            lengths = [_plan_length_after(rot, m, target) for m in options]
+            assert lengths == sorted(lengths)
+
+
+def test_how_much_choice_there_is_depends_on_where_the_target_is():
+    """The lopsidedness that makes `extra_moves` necessary.
+
+    A side face has exactly one shortest route, so strict equivalence offers no
+    alternative at all -- which is the common case, and the reason the arm needs
+    permission to take a longer way round.
+    """
+    import collections
+
+    strict = collections.Counter()
+    widened = collections.Counter()
+    for rot in all_orientations():
+        for target in range(1, 7):
+            shortest = len(plan_exact(rot, target))
+            strict[(shortest, len(equivalent_first_moves(rot, target)))] += 1
+            widened[(shortest, len(equivalent_first_moves(rot, target, 1)))] += 1
+
+    assert strict == {(0, 0): 24, (1, 1): 96, (2, 4): 24}
+    assert widened == {(0, 0): 24, (1, 3): 96, (2, 4): 24}
+
+
+def test_no_alternatives_when_the_target_is_already_up():
+    for rot in all_orientations():
+        assert equivalent_first_moves(rot, up_face(rot), extra_moves=3) == []
+
+
+def test_the_policy_offers_all_four_probes_when_it_knows_nothing():
+    """Before the first probe the four sides are indistinguishable, so every
+    primitive is equally informative and the arm may take any of them."""
+    policy = DeductivePolicy(target_face=3)
+    preferred = policy.observe(5)
+    options = policy.options()
+    assert options[0] == preferred
+    assert len(options) == len(PRIMITIVES)
+    assert set(options) == set(PRIMITIVES)
+
+
+def test_substituting_an_alternative_keeps_the_deduction_true():
+    """The model must track the turn the arm actually made, not the one asked for."""
+    for rot in all_orientations():
+        for target in range(1, 7):
+            if up_face(rot) == target:
+                continue
+            policy = DeductivePolicy(target)
+            state = rot
+            for step in range(6):
+                move = policy.observe(up_face(state))
+                if move is None:
+                    break
+                options = policy.options(extra_moves=1)
+                chosen = options[-1] if step == 0 else options[0]
+                policy.substitute(chosen)
+                state = apply(state, chosen)
+                if policy.orientation is not None:
+                    assert up_face(policy.orientation) == up_face(state)
+            assert up_face(state) == target
+
+
+def test_substituting_the_preferred_move_changes_nothing():
+    policy = DeductivePolicy(target_face=2)
+    move = policy.observe(5)
+    before = policy.options()
+    policy.substitute(move)
+    assert policy.options() == before
+
+
+def test_taking_an_alternative_never_costs_more_than_one_extra_regrasp():
+    for rot in all_orientations():
+        for target in range(1, 7):
+            baseline = len(simulate_blind(rot, target))
+            policy = DeductivePolicy(target)
+            state, moves = rot, 0
+            while moves < 8:
+                move = policy.observe(up_face(state))
+                if move is None:
+                    break
+                chosen = policy.options()[-1]  # always the least-preferred
+                policy.substitute(chosen)
+                state = apply(state, chosen)
+                moves += 1
+            assert up_face(state) == target
+            assert moves <= baseline + 1

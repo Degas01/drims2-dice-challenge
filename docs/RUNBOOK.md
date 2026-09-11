@@ -8,6 +8,12 @@ Two conventions used throughout:
 * **host** = your WSL2 shell, prompt `giacomo@...`
 * **container** = inside the DRIMS image, prompt `drims@...`
 
+The two are not interchangeable and the prompt is the only thing that tells them
+apart. `docker` exists **only on the host**; the ROS tools exist **only in the
+container**; your Windows drive under `/mnt/c` is visible **only from the host**.
+When in doubt, `whoami` answers it — `giacomo` is the host, `drims` is the
+container. `exit` leaves the container and returns you to the host.
+
 Run commands **one line at a time**. A trailing `\` that gets pasted wrong turns
 the next line into an argument of the previous one, which fails silently and
 wastes a rebuild.
@@ -24,8 +30,23 @@ cd ~/DRIMS2-2026
 ```
 
 `34` is the ROS domain ID; any number 0–101 works as long as it is the same for
-every terminal. If this drops you into the container the prompt changes to
-`drims@`; otherwise run `./connect.sh`.
+every terminal.
+
+**`start.sh` usually drops you straight into the container** — watch the prompt
+change to `drims@`. That is convenient and it is also the commonest way to get
+stuck: anything needing `docker` or `/mnt/c` has to happen on the *host*, so
+`exit` first. `./connect.sh` opens a fresh container shell whenever you want one.
+
+### Getting files into the container (host)
+
+The container cannot see your Windows drive, so copy across explicitly:
+
+```bash
+docker cp "/mnt/c/path/to/drims2-dice-challenge.tar.gz" drims2:/home/drims/
+```
+
+`bash: docker: command not found` means you are inside the container — `exit`
+and run it again.
 
 ### Make the workspace source itself (container, once)
 

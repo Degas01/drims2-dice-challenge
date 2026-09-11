@@ -58,6 +58,8 @@ __all__ = [
     "apply",
     "plan_exact",
     "plan_from_normals",
+    "equivalent_first_moves",
+    "orientation_from_normals",
     "nearest_cube_rotation",
     "CUBE_ROTATIONS",
     "next_blind_move",
@@ -291,17 +293,58 @@ def plan_exact(orientation: np.ndarray, target_face: int) -> List[Regrasp]:
     )
 
 
-def plan_from_normals(
-    face_normals_world: Dict[int, Sequence[float]], target_face: int
+def equivalent_first_moves(
+    orientation: np.ndarray, target_face: int, extra_moves: int = 0
 ) -> List[Regrasp]:
-    """Plan from measured face normals instead of a rotation matrix.
+    """Moves that start a plan no longer than the shortest, plus ``extra_moves``.
+
+    The moves returned are interchangeable to the *die* and quite different to
+    the *arm*: each implies a different grasp axis, so a different wrist
+    orientation, and on a six-axis arm reaching across a board some of those
+    orientations have no inverse-kinematics solution while others are
+    comfortable. Being able to say "that grasp was refused, take another route"
+    is what turns an unreachable die into a reachable one.
+
+    How much choice there is depends on where the target is, and the answer is
+    lopsided:
+
+    * the target is **already up** -- no moves, nothing to do;
+    * the target is a **side** face -- exactly **one** shortest move. Only one
+      rotation brings a given side to the top, so there is no alternative at
+      this length;
+    * the target is the **bottom** face -- **four** shortest routes, since any
+      axis turned twice in either direction gets there.
+
+    So for the commonest case, strict equivalence offers nothing, which is why
+    ``extra_moves`` exists. Allowing one turn more than necessary opens up
+    alternatives for every case at a cost of one re-grasp -- a good trade when
+    the alternative is not moving at all. Returned shortest-first, so a caller
+    that walks the list in order pays the extra turn only if it has to.
+    """
+    if up_face(orientation) == target_face:
+        return []
+
+    limit = len(plan_exact(orientation, target_face)) + max(0, int(extra_moves))
+    scored = []
+    for move in PRIMITIVES:
+        nxt = apply(orientation, move)
+        length = 1 if up_face(nxt) == target_face else 1 + len(plan_exact(nxt, target_face))
+        if length <= limit:
+            scored.append((length, move))
+    return [move for _, move in sorted(scored, key=lambda pair: pair[0])]
+
+
+def orientation_from_normals(
+    face_normals_world: Dict[int, Sequence[float]]
+) -> np.ndarray:
+    """Recover the die's orientation from measured face normals.
 
     ``face_normals_world`` maps each face id to that face's outward normal
     expressed in the world/base frame -- exactly what you get by looking up the
     ``face{1..6}_tf`` frames published by ``drims_dice_simulator`` and rotating
     their local +Z into the base frame.  The nearest cube-group orientation is
-    recovered by orthonormalising the measurement, which makes the planner
-    robust to the small numerical noise in TF.
+    recovered by orthonormalising the measurement, which makes it robust to the
+    small numerical noise in TF.
     """
     # Columns of R are the world directions of the body axes X, Y, Z.
     # Body +X is face 5's normal, +Y is face 3's, +Z is face 6's.
@@ -320,7 +363,14 @@ def plan_from_normals(
     if np.linalg.det(rot) < 0:
         u[:, -1] *= -1
         rot = u @ vt
-    return plan_exact(nearest_cube_rotation(rot), target_face)
+    return nearest_cube_rotation(rot)
+
+
+def plan_from_normals(
+    face_normals_world: Dict[int, Sequence[float]], target_face: int
+) -> List[Regrasp]:
+    """Shortest plan from measured face normals instead of a rotation matrix."""
+    return plan_exact(orientation_from_normals(face_normals_world), target_face)
 
 
 # --------------------------------------------------------------------------- #
@@ -388,6 +438,10 @@ class DeductivePolicy:
         self.reasoning: str = "nothing observed yet"
         self._probe: Optional[Regrasp] = None
         self._top_before_probe: Optional[int] = None
+        #: Every move that would have been equally acceptable this step.
+        self._options: List[Regrasp] = []
+        #: State before the last decision, so ``substitute`` can rewind.
+        self._before: Optional[tuple] = None
 
     # -- knowledge --------------------------------------------------------- #
 
@@ -446,13 +500,29 @@ class DeductivePolicy:
             )
             self.orientation = None
 
+        self._before = (
+            None if self.orientation is None else self.orientation.copy(),
+            self._probe,
+            self._top_before_probe,
+        )
+
         if self.orientation is not None:
-            move = plan_exact(self.orientation, self.target_face)[0]
+            # Any move that starts a shortest plan will do; the arm may have an
+            # opinion about which, so offer all of them.
+            self._options = equivalent_first_moves(self.orientation, self.target_face)
+            move = self._options[0]
             self.orientation = apply(self.orientation, move)
             return move
 
         # Nothing known beyond the top and bottom faces.  One quarter turn about
         # the grasp axis both makes progress and reveals a side face.
+        #
+        # *Any* quarter turn does: with the four sides indistinguishable, every
+        # primitive is equally informative, so all four are offered and the arm
+        # takes whichever it can actually reach.
+        self._options = [Regrasp(self.axis, 1)] + [
+            m for m in PRIMITIVES if m != Regrasp(self.axis, 1)
+        ]
         self._probe = Regrasp(self.axis, 1)
         self._top_before_probe = current_face
         if self.target_face == opposite(current_face):
@@ -466,6 +536,63 @@ class DeductivePolicy:
                 f"{self.axis.upper()} to read a side face and pin the configuration down"
             )
         return self._probe
+
+
+    # -- alternatives ------------------------------------------------------ #
+
+    def options(self, extra_moves: int = 0) -> List[Regrasp]:
+        """Moves that were acceptable at the last :meth:`observe`, best first.
+
+        The first is the one :meth:`observe` returned.  The rest are genuine
+        alternatives, for when the arm cannot reach the grasp the first one
+        implies.  ``extra_moves`` widens the set to routes that take that many
+        turns more than necessary -- worth it only once the free alternatives
+        are exhausted.
+
+        A caller that *always* took the longest offered route would never
+        finish: a route one turn longer than necessary leaves the die one turn
+        from the target again, so the same choice reappears forever. That is not
+        a flaw in the widening but a constraint on how to use it -- as a
+        within-step fallback, reached only after the arm has refused everything
+        shorter, with the loop's own re-grasp budget as the backstop.
+        """
+        if extra_moves <= 0 or self.orientation is None or self._before is None:
+            return list(self._options)
+
+        orientation_before = self._before[0]
+        if orientation_before is None:
+            return list(self._options)
+
+        wider = equivalent_first_moves(orientation_before, self.target_face, extra_moves)
+        ordered = list(self._options) + [m for m in wider if m not in self._options]
+        return ordered
+
+    def substitute(self, move: Regrasp) -> None:
+        """Tell the policy a *different* one of its options actually ran.
+
+        :meth:`observe` assumes its own first choice will be executed, because
+        that is true nearly always and it keeps the common path simple.  When
+        the arm forces a different route this rewinds that assumption and
+        re-applies the real one, so the deduced configuration stays true.
+
+        Getting this wrong is not catastrophic -- the next observation catches a
+        model that disagrees with the camera and drops it -- but it would cost a
+        re-grasp every time, which is exactly what the deduction is there to
+        avoid.
+        """
+        if not self._options or move == self._options[0] or self._before is None:
+            return
+        orientation_before, _, _ = self._before
+
+        if orientation_before is not None:
+            # The configuration was known: rewind the assumed turn, apply the
+            # real one.
+            self.orientation = apply(orientation_before, move)
+        else:
+            # We were probing. The observation that set up the deduction still
+            # stands; only the turn about to be made changes.
+            self._probe = move
+        self._options = [move]
 
 
 #: Kept so older configs and notes that say "blind" keep working.

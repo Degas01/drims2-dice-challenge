@@ -14,7 +14,7 @@ Built against the school's own stack — [`drims_cells`], [`easy_motion`] and
 [`drims2_dice_simulator`] — and running inside the [DRIMS2 Docker image].
 
 **Status:** runs end to end in simulation — perception, deduction, grasp, flip,
-place — with 347 offline tests covering the parts that do not need a robot.
+place — with 355 offline tests covering the parts that do not need a robot.
 Not yet run on the physical cell.
 
 <p align="center">
@@ -446,12 +446,37 @@ Two consequences, both in the code:
   which one is out of range, because `-31` on its own names neither the pose nor
   the cause.
 
-**This is documented rather than solved.** The proper fix is to plan the *pick
-position* alongside the grasp — nudge the die to a friendlier part of the board
-first, or choose among equally valid re-grasp moves by reachability. The
-deductive policy makes that natural in principle, since its probe turn can go
-about either axis in either direction and all four are equally informative. The
-plumbing to feed reachability back into move selection is not written.
+**And a third: the arm may take a different route entirely.** When a grasp is
+refused, the state machine does not only vary the lean — it asks the planner for
+*other turns that are just as good* and tries those. Each one implies a different
+grasp axis, so a different wrist orientation, which is exactly the freedom a
+near-singular arm needs.
+
+How much choice there is depends on where the target face is, and it is lopsided:
+
+| target is… | shortest routes | alternatives at that length |
+| --- | --- | --- |
+| already up | 0 | — |
+| a **side** face | 1 turn | **none** — only one rotation brings a given side up |
+| the **bottom** face | 2 turns | 4 — any axis, either direction |
+
+The common case offers nothing, which is why the search may also take a route one
+turn *longer* than necessary once the free alternatives are exhausted
+(`extra_moves_when_stuck`). Paying one extra re-grasp beats not moving. The
+ordering matters and is deliberate: lean first, then alternative turns, then
+wrist roll — because a lean of 32° or more lets the die be *placed*, while
+straight down forces it to be *dropped*, so keeping a good lean is worth more
+than keeping the preferred turn.
+
+Both the deductive policy and the exact planner supply these alternatives, and
+when the arm takes one the policy is told (`substitute`), so its deduced model of
+the die keeps matching the die. That is proved exhaustively: from every start,
+every target, always taking the *least* preferred option still reaches the target
+and costs at most one extra re-grasp.
+
+**What is still not solved** is moving the die itself. If no grasp at a position
+works, the honest fix is to nudge the die to a friendlier part of the board and
+try again from there. That is not written.
 
 Two smaller motion fixes came with it:
 
@@ -541,7 +566,7 @@ and direction, sensor noise and JPEG quality.
 | PnP yaw error | **1.4° median, 5.0° p95** |
 | Undistortion vs OpenCV run to convergence | **agrees to 1e-9** |
 | Cycle time, blended vs stop-at-every-waypoint | **5.61 s vs 7.37 s (−24 %)** |
-| Test count | **347 passing** |
+| Test count | **355 passing** |
 | End-to-end cycle in simulation | **completed**, 1 re-grasp, die at y = 0.58 |
 
 Position error is measured end to end: detect the die, self-calibrate the
@@ -580,7 +605,7 @@ src/dice_task/
   dice_task/trajectory.py             LIN path, trapezoidal profile, SLERP, blending (no ROS)
   dice_task/cartesian_executor.py     sample → IK → JointTrajectory          (no ROS)
   dice_task/dice_task_node.py         the state machine
-tests/                                347 tests, all offline
+tests/                                355 tests, all offline
 scripts/make_docs_images.py           regenerates every figure in this README
 ```
 
@@ -834,6 +859,8 @@ ros2 launch dice_task dice_challenge.launch.py \
 | `dice_task/gripper_close_axis` | `y` | Which **tool** axis the fingers close along. Wrong value ⇒ the die is grabbed on its corners. Quote it: YAML 1.1 reads a bare `y` as `true`. |
 | `dice_task/grasp_tilt_deg` | `45` | How far the gripper leans off vertical to grasp. `0` restores a straight-down grasp, which **cannot put the die back down** after a 90° flip — see [Putting the die back down](#putting-the-die-back-down). |
 | `dice_task/lift_height_m` | `0.12` | Lift before turning; too small clips the board. |
+| `dice_task/extra_moves_when_stuck` | `1` | How many turns longer than necessary a fallback route may be. `0` means only strictly equivalent routes, which for a side-face target is none at all. |
+| `dice_task/max_grasp_attempts` | `8` | Refused grasps allowed per re-grasp before the cycle gives up. |
 | `dice_task/reach_radius_m` | `0.850` | The arm's reach *to its flange*. Diagnostics only — turns MoveIt's `-31` into a message naming the pose and the distance. `0` disables. |
 | `dice_task/tool_length_m` | `0.15` | Flange to fingertips. Read from TF when available; this is the fallback. |
 | `dice_vision/board_origin_in_base` | `[0.60, 0.10, -0.01]` | Board centre in the base frame; Z is the cell's `surface_height`. |
@@ -866,6 +893,12 @@ Integration problems hit while bringing this up on WSL2, and what they look like
 | The wrist spins a half turn before touching the die | A grasp and the same grasp rolled 180° about its approach axis are equally valid, and the arm was handed whichever the maths produced first. | Fixed by `nearest_equivalent_grasp`, which reads the current tool orientation from TF and picks the nearer of the two. |
 | `ros2 pkg executables dice_vision` lists only `dice_vision_node` | The workspace was built before `fake_camera_node` existed. | `colcon build --packages-select dice_vision --symlink-install` and re-source `install/setup.bash`. |
 
+## Running it, step by step
+
+[`docs/RUNBOOK.md`](docs/RUNBOOK.md) is every command in order with the output
+each should produce — setup, the five terminals, the colour sweep, the deduction
+demo, and what to do when something goes wrong.
+
 ## Engineering log
 
 Most of the interesting work was in the gap between "the tests pass" and "the
@@ -890,9 +923,9 @@ geometry when the answer was that the die was 7 cm too far from the robot.
   constraint.** The Cartesian profile is capped by Cartesian limits and the IK
   path is only checked for branch continuity, not against joint velocity limits;
   the controller will reject a trajectory that exceeds them.
-* **The workspace limitation above is documented, not solved.** A die near the
-  far edge of the board can be unreachable in every grasp orientation even though
-  its position is well inside the arm's envelope.
+* **The workspace limitation is mitigated, not eliminated.** The arm now tries
+  other leans, wrist rolls and equally good turns before giving up, but if a die
+  sits somewhere no grasp orientation works, nothing moves it somewhere better.
 * **No hardware run.** Everything here is simulation plus offline tests against a
   synthetic camera; the provided rosbags are the next validation step. The
   LabVIEW sensor/actuator work for the gripper needs the physical cell.

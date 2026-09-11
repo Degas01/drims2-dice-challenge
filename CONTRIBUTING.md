@@ -7,7 +7,7 @@ test suite runs on any machine:
 
 ```bash
 pip install opencv-python-headless numpy pytest
-pytest -q                          # ~4 minutes, 347 tests
+pytest -q                          # ~4 minutes, 355 tests
 pytest tests/test_die_model.py -q  # the planners alone, under a second
 ```
 

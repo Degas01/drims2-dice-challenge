@@ -175,9 +175,20 @@ class DiceTaskNode(Node):
         # 30 mm, matching what drims_dice_simulator actually spawns (its log
         # says "size 0.03"); the DRIMS default config says 27 mm.
         self.declare_parameter("dice_size_m", 0.030)
-        # dice_tf is published on the die's top face, not at its centre -- see
-        # lookup_die_pose, which measures the offset from the spawner's own numbers.
-        self.declare_parameter("die_frame_on_top_face", True)
+        # How far BELOW dice_tf to put the tool tip when grasping.
+        #
+        # dice_tf really is published on the die's top face rather than at its
+        # centre -- the spawner's own log proves it, see lookup_die_pose. But
+        # grasping at the true centre does not work, and the reason is nothing to
+        # do with geometry: the die is a *collision object* in the planning
+        # scene, so driving the tool tip 15 mm down into the middle of that box
+        # is a collision and MoveIt refuses the descent in under 200 ms.
+        #
+        # So 0 by default: put the tip on the frame the simulator publishes,
+        # which is what it intends to be grasped at. A real gripper closing on a
+        # real die would want half a die lower (0.015) and has no planning scene
+        # to object.
+        self.declare_parameter("grasp_depth_below_die_frame_m", 0.0)
         # How far the gripper leans off vertical to grasp, in degrees.  45 puts
         # the 90-degree flip symmetrically either side of vertical so neither
         # end of it is horizontal; 0 restores the old straight-down grasp, which
@@ -407,15 +418,12 @@ class DiceTaskNode(Node):
         yaw = float(math.atan2(rot[1, 0], rot[0, 0]))
         yaw = (yaw + math.pi / 4) % (math.pi / 2) - math.pi / 4
 
-        # ``dice_tf`` sits on the die's **top face**, not at its centre.
-        #
-        # Worth checking rather than assuming, and the simulator's own log gives
-        # the numbers: it reports surface_height -0.020 and size 0.030, so the
-        # centre is at -0.005 in base_link -- but the frame comes back at +0.011,
-        # which is half a die higher. Grasping at the frame therefore closes the
-        # fingers on the top edge, and every height derived from it -- lift,
-        # place, board clearance -- is off by the same 15 mm.
-        offset = 0.5 * float(self.p("dice_size_m")) if self.p("die_frame_on_top_face") else 0.0
+        # ``dice_tf`` sits on the die's **top face**, not at its centre: the
+        # spawner reports surface_height -0.020 and size 0.030, so the centre is
+        # at -0.005 in base_link, while the frame arrives at +0.011 -- half a die
+        # higher. Worth knowing, and *not* worth correcting for by default; see
+        # ``grasp_depth_below_die_frame_m``.
+        offset = float(self.p("grasp_depth_below_die_frame_m"))
         return np.array([t.x, t.y, t.z - offset]), yaw
 
 
@@ -797,7 +805,9 @@ class DiceChallenge:
         # self-correcting, because it lands flat on the face the turn chose and
         # the next loop re-reads it either way.
         die_size = float(self.node.p("dice_size_m"))
-        board_z = die_center[2] - 0.5 * die_size
+        # The board sits a die-height below the top face. die_center is measured
+        # from dice_tf, which is on that top face, less the grasp depth.
+        board_z = die_center[2] + float(self.node.p("grasp_depth_below_die_frame_m")) - die_size
         place_z = release_height(
             board_z,
             float(die_center[2]),

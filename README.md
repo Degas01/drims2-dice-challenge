@@ -11,8 +11,6 @@ face is up.
   <br><em><b>
 
 <p align="center">
-  <a href="https://github.com/Degas01/drims2-dice-challenge/actions/workflows/tests.yml"><img src="https://github.com/Degas01/drims2-dice-challenge/actions/workflows/tests.yml/badge.svg" alt="tests"></a>
-  <img src="https://img.shields.io/badge/tests-355%20passing-4c1.svg" alt="355 tests passing">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
 </p>
 

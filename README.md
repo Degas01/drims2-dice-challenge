@@ -8,11 +8,13 @@ face is up.
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/814c1a25-14c8-4106-875f-3ab3e9f63ca5" alt="The DRIMS 2026 robot cell: a UR5e with a Robotiq Hand-E gripper over the green board, with the overhead camera on its frame" width="55%">
-  <br><em><b>The cell this project targets.</b> UR5e with a Robotiq Hand-E gripper over the green board, overhead camera on the frame above — DRIMS 2026, Poggio all'Agnello.<br>
-  Every result reported below was obtained in the simulated twin of this cell; the hardware run is listed under <a href="#15-limitations-and-future-work">Limitations</a>.</em></p>
+  <br><em><b>
 
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![ROS 2 Humble](https://img.shields.io/badge/ROS%202-Humble-22314E.svg)](https://docs.ros.org/en/humble/)
+
+The cell this project targets.</b> UR5e with a Robotiq Hand-E gripper over the green board, overhead camera on the frame above — DRIMS 2026, Poggio all'Agnello.<br>
+  Every result reported below was obtained in the simulated twin of this cell; the hardware run is listed under <a href="#15-limitations-and-future-work">Limitations</a>.</em></p>
 
 Built against the school's own stack — [`drims_cells`], [`easy_motion`] and
 [`drims2_dice_simulator`] — and running inside the [DRIMS2 Docker image].

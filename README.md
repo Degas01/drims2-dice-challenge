@@ -6,7 +6,11 @@ board finds the die and reads its top face; a state machine decides which
 re-grasp to make; `easy_motion`/MoveIt executes it; repeat until the requested
 face is up.
 
-[![tests](https://github.com/GIACOMO-GITHUB-USERNAME/drims2-dice-challenge/actions/workflows/tests.yml/badge.svg)](https://github.com/GIACOMO-GITHUB-USERNAME/drims2-dice-challenge/actions/workflows/tests.yml)
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/814c1a25-14c8-4106-875f-3ab3e9f63ca5" alt="The DRIMS 2026 robot cell: a UR5e with a Robotiq Hand-E gripper over the green board, with the overhead camera on its frame" width="55%">
+  <br><em><b>The cell this project targets.</b> UR5e with a Robotiq Hand-E gripper over the green board, overhead camera on the frame above — DRIMS 2026, Poggio all'Agnello.<br>
+  Every result reported below was obtained in the simulated twin of this cell; the hardware run is listed under <a href="#15-limitations-and-future-work">Limitations</a>.</em></p>
+
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![ROS 2 Humble](https://img.shields.io/badge/ROS%202-Humble-22314E.svg)](https://docs.ros.org/en/humble/)
 
@@ -154,6 +158,18 @@ Each is rendered only while something is subscribed.
 <p align="center">
   <img src="docs/images/topics.png" alt="The four published debug topics" width="100%">
 </p>
+
+#### Recording — the perception pipeline running live
+
+https://github.com/user-attachments/assets/5475ab0b-13d9-4061-bb03-9a3a752b28b3
+
+`/dice_vision/mosaic` in RViz, all four stages updating together at 10 Hz while the
+die's colour is changed underneath the detector with `ros2 param set /fake_camera
+die_colour ...`. Nothing is restarted and no threshold is retuned between colours:
+the board is what is segmented, so the die is simply *whatever is left*, and the
+name attached to it is read afterwards from the pixels the mask already found. The
+bottom-right card updates on every frame with the face value, the colour name, the
+swatch those pixels produced, the board position in millimetres and the yaw.
 
 <p align="center">
   <img src="docs/images/readout.png" alt="Close-up of the readout card" width="70%">
@@ -543,6 +559,21 @@ Two honesty notes, both enforced by tests:
 collision checks**, so it is off by default, and it refuses to execute a path
 whose IK solutions jump between branches — the signature of an elbow flip that
 would sweep the arm across the cell — falling back to the MoveIt path instead.
+
+#### Recording — one complete re-grasp cycle
+
+<p align="center">
+  <img src="docs/media/regrasp_cycle.gif" alt="The UR5e approaching the die at a lean, closing the gripper, lifting, rotating the wrist 90 degrees and setting the die back down" width="85%">
+</p>
+
+The whole loop, end to end: identify → deduce the turn → approach at a **−45° lean**
+→ close → lift → rotate the wrist **+90° about X** → descend at **+45°** → release →
+re-identify. The lean is the part worth watching — the gripper is never vertical and
+never horizontal, which is precisely what §6.1 and §6.2 below are about. The run
+shown reached the requested face in one re-grasp, 155 s of robot time at
+`velocity_scaling: 0.3`.
+
+*Sped up ×7 — [full 92 s recording](docs/media/regrasp_cycle.mp4)*
 
 ---
 

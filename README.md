@@ -11,8 +11,26 @@ face is up.
   <br><em><b>
 
 <p align="center">
+  <a href="https://github.com/Degas01/drims2-dice-challenge/actions/workflows/tests.yml"><img src="https://github.com/Degas01/drims2-dice-challenge/actions/workflows/tests.yml/badge.svg" alt="tests"></a>
+  <img src="https://img.shields.io/badge/tests-355%20passing-4c1.svg" alt="355 tests passing">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
-  <a href="https://docs.ros.org/en/humble/"><img src="https://img.shields.io/badge/ROS%202-Humble-22314E.svg" alt="ROS 2 Humble"></a>
+</p>
+
+<p align="center">
+  <a href="https://docs.ros.org/en/humble/"><img src="https://img.shields.io/badge/ROS%202-Humble-22314E.svg?logo=ros&logoColor=white" alt="ROS 2 Humble"></a>
+  <a href="https://moveit.ai/"><img src="https://img.shields.io/badge/MoveIt-2-0A7BBB.svg" alt="MoveIt 2"></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10-3776AB.svg?logo=python&logoColor=white" alt="Python 3.10"></a>
+  <a href="https://opencv.org/"><img src="https://img.shields.io/badge/OpenCV-4.x-5C3EE8.svg?logo=opencv&logoColor=white" alt="OpenCV 4"></a>
+  <a href="https://numpy.org/"><img src="https://img.shields.io/badge/NumPy-1.x-013243.svg?logo=numpy&logoColor=white" alt="NumPy"></a>
+  <a href="https://docs.pytest.org/"><img src="https://img.shields.io/badge/pytest-7.x-0A9EDC.svg?logo=pytest&logoColor=white" alt="pytest"></a>
+  <a href="https://www.docker.com/"><img src="https://img.shields.io/badge/Docker-WSL2-2496ED.svg?logo=docker&logoColor=white" alt="Docker on WSL2"></a>
+  <a href="https://releases.ubuntu.com/22.04/"><img src="https://img.shields.io/badge/Ubuntu-22.04-E95420.svg?logo=ubuntu&logoColor=white" alt="Ubuntu 22.04"></a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/robot-UR5e-1F6FEB.svg" alt="Universal Robots UR5e">
+  <img src="https://img.shields.io/badge/gripper-Robotiq%20Hand--E-6E7681.svg" alt="Robotiq Hand-E">
+  <img src="https://img.shields.io/badge/DRIMS-2026-8B5CF6.svg" alt="DRIMS 2026">
 </p>
 
 The cell this project targets.</b> UR5e with a Robotiq Hand-E gripper over the green board, overhead camera on the frame above — DRIMS 2026, Poggio all'Agnello.<br>

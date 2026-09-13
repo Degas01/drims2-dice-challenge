@@ -584,9 +584,9 @@ would sweep the arm across the cell — falling back to the MoveIt path instead.
 
 #### Recording — one complete re-grasp cycle
 
-https://github.com/user-attachments/assets/8edf0ab8-ce95-4d85-85b9-edab30237104
-
 https://github.com/user-attachments/assets/6ca6b842-cedf-443b-858b-a45d6331eb4f
+
+https://github.com/user-attachments/assets/8edf0ab8-ce95-4d85-85b9-edab30237104
 
 The whole loop, end to end: identify → deduce the turn → approach at a **−45° lean**
 → close → lift → rotate the wrist **+90° about X** → descend at **+45°** → release →
@@ -594,8 +594,6 @@ re-identify. The lean is the part worth watching — the gripper is never vertic
 never horizontal, which is precisely what §6.1 and §6.2 below are about. The run
 shown reached the requested face in one re-grasp, 155 s of robot time at
 `velocity_scaling: 0.3`.
-
-*Sped up ×7 — [full 92 s recording](docs/media/regrasp_cycle.mp4)*
 
 ---
 
@@ -706,12 +704,23 @@ ros2 launch drims_description ur5e_1_start.launch.py fake:=true
 sets both the spawn bounds and the surface height, and it *overrides* any
 `surface_height:=` you pass, so there is no point setting that by hand.
 
-| cell | x range | y range | surface_height |
-| --- | --- | --- | --- |
-| 1 | −0.35 … 0.15 | 0.50 … 0.85 | −0.04 |
-| 2 | −0.30 … 0.20 | 0.50 … 0.85 | −0.02 |
-| 3 | −0.28 … 0.22 | 0.35 … 0.70 | −0.01 |
-| 4 | −0.30 … 0.20 | 0.50 … 0.85 | −0.02 |
+<table align="center">
+  <tr>
+    <th>cell</th><th>x range</th><th>y range</th><th>surface_height</th>
+  </tr>
+  <tr>
+    <td align="center">1</td><td align="center">−0.35 … 0.15</td><td align="center">0.50 … 0.85</td><td align="center">−0.04</td>
+  </tr>
+  <tr>
+    <td align="center">2</td><td align="center">−0.30 … 0.20</td><td align="center">0.50 … 0.85</td><td align="center">−0.02</td>
+  </tr>
+  <tr>
+    <td align="center">3</td><td align="center">−0.28 … 0.22</td><td align="center">0.35 … 0.70</td><td align="center">−0.01</td>
+  </tr>
+  <tr>
+    <td align="center">4</td><td align="center">−0.30 … 0.20</td><td align="center">0.50 … 0.85</td><td align="center">−0.02</td>
+  </tr>
+</table>
 
 ```bash
 ros2 launch drims_dice_simulator spawn_dice.launch.py \

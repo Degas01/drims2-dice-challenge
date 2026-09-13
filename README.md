@@ -582,9 +582,9 @@ would sweep the arm across the cell — falling back to the MoveIt path instead.
 
 #### Recording — one complete re-grasp cycle
 
-<p align="center">
-  <img src="docs/media/regrasp_cycle.gif" alt="The UR5e approaching the die at a lean, closing the gripper, lifting, rotating the wrist 90 degrees and setting the die back down" width="85%">
-</p>
+https://github.com/user-attachments/assets/8edf0ab8-ce95-4d85-85b9-edab30237104
+
+https://github.com/user-attachments/assets/6ca6b842-cedf-443b-858b-a45d6331eb4f
 
 The whole loop, end to end: identify → deduce the turn → approach at a **−45° lean**
 → close → lift → rotate the wrist **+90° about X** → descend at **+45°** → release →

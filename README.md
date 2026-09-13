@@ -53,13 +53,36 @@ The challenge decomposes into two problems that are interesting for different
 reasons, and both are solved in **ROS-free, unit-tested Python** with a thin ROS
 node wrapped around each:
 
-| Problem | Module | Why it is not trivial |
-| --- | --- | --- |
-| Read the die | `dice_vision/detector.py` | The die's colour is not fixed, the board is unevenly lit, the die casts a hard shadow, and at 25 px across its pips touch. |
-| Decide how to turn it | `dice_task/die_model.py` | A gripper coming from above can only rotate the die about a horizontal axis, and a single camera cannot see which lateral face is which. |
-| Locate it in metres | `dice_vision/camera_model.py`, `board_geometry.py` | A single camera cannot measure range without a size prior, and at 25 px the size prior is 9 % out. |
-| Move without stopping | `dice_task/trajectory.py` | MoveIt plans every pose request to a full stop, and the challenge is scored on cycle time. |
-| Put the die back down | `dice_task/grasping.py` | A 90° flip rotates the *gripper* by 90° too, so a straight-down grasp finishes pointing sideways — with the gripper's own body where the board is. |
+<table align="center">
+  <tr>
+    <th>Problem</th><th>Module</th><th>Why it is not trivial</th>
+  </tr>
+  <tr>
+    <td>Read the die</td>
+    <td><code>dice_vision/detector.py</code></td>
+    <td>The die's colour is not fixed, the board is unevenly lit, the die casts a hard shadow, and at 25 px across its pips touch.</td>
+  </tr>
+  <tr>
+    <td>Decide how to turn it</td>
+    <td><code>dice_task/die_model.py</code></td>
+    <td>A gripper coming from above can only rotate the die about a horizontal axis, and a single camera cannot see which lateral face is which.</td>
+  </tr>
+  <tr>
+    <td>Locate it in metres</td>
+    <td><code>dice_vision/camera_model.py</code>, <code>board_geometry.py</code></td>
+    <td>A single camera cannot measure range without a size prior, and at 25 px the size prior is 9 % out.</td>
+  </tr>
+  <tr>
+    <td>Move without stopping</td>
+    <td><code>dice_task/trajectory.py</code></td>
+    <td>MoveIt plans every pose request to a full stop, and the challenge is scored on cycle time.</td>
+  </tr>
+  <tr>
+    <td>Put the die back down</td>
+    <td><code>dice_task/grasping.py</code></td>
+    <td>A 90° flip rotates the <em>gripper</em> by 90° too, so a straight-down grasp finishes pointing sideways — with the gripper's own body where the board is.</td>
+  </tr>
+</table>
 
 Everything else — the ROS nodes, launch files, parameters — is plumbing around
 those.
@@ -165,13 +188,31 @@ that is how you debug a vision node: you look at the stage where it *first* went
 wrong instead of guessing from a wrong final number. Keeping that ability after
 the pipeline works costs nothing, so all of it is published:
 
-| topic | what it shows |
-| --- | --- |
-| `~/board_mask` | the segmented green board |
-| `~/object_mask` | everything on the board that is not board-coloured, in its own colours rather than as a white blob — a mask that has quietly swallowed a shadow looks identical in binary and obvious in colour |
-| `~/bounding_box` | the oriented bounding box and centre |
-| `~/overlay` | the readout: face value, colour name **and swatch**, position on the board, yaw. Also published as `~/debug_image` |
-| `~/mosaic` | all four tiled and labelled, so one rviz panel shows the whole pipeline |
+<table align="center">
+  <tr>
+    <th>topic</th><th>what it shows</th>
+  </tr>
+  <tr>
+    <td><code>~/board_mask</code></td>
+    <td>the segmented green board</td>
+  </tr>
+  <tr>
+    <td><code>~/object_mask</code></td>
+    <td>everything on the board that is not board-coloured, in its own colours rather than as a white blob — a mask that has quietly swallowed a shadow looks identical in binary and obvious in colour</td>
+  </tr>
+  <tr>
+    <td><code>~/bounding_box</code></td>
+    <td>the oriented bounding box and centre</td>
+  </tr>
+  <tr>
+    <td><code>~/overlay</code></td>
+    <td>the readout: face value, colour name <strong>and swatch</strong>, position on the board, yaw. Also published as <code>~/debug_image</code></td>
+  </tr>
+  <tr>
+    <td><code>~/mosaic</code></td>
+    <td>all four tiled and labelled, so one rviz panel shows the whole pipeline</td>
+  </tr>
+</table>
 
 Each is rendered only while something is subscribed.
 
@@ -280,11 +321,26 @@ is exactly the input to PnP. So the obvious move is to solve for the full 6-DoF
 pose and be done. Measured against ground truth over 120 random scenes, that
 turns out to be the wrong call:
 
-| position estimator | median | p95 |
-| --- | --- | --- |
-| PnP, straight from the detector's quad | 14.6 mm | 46.7 mm |
-| PnP, refined onto the known board plane | 3.4 mm | 6.6 mm |
-| **homography onto the known board plane** | **1.5 mm** | **2.9 mm** |
+<table align="center">
+  <tr>
+    <th>position estimator</th><th align="right">median</th><th align="right">p95</th>
+  </tr>
+  <tr>
+    <td>PnP, straight from the detector's quad</td>
+    <td align="right">14.6 mm</td>
+    <td align="right">46.7 mm</td>
+  </tr>
+  <tr>
+    <td>PnP, refined onto the known board plane</td>
+    <td align="right">3.4 mm</td>
+    <td align="right">6.6 mm</td>
+  </tr>
+  <tr>
+    <td><strong>homography onto the known board plane</strong></td>
+    <td align="right"><strong>1.5 mm</strong></td>
+    <td align="right"><strong>2.9 mm</strong></td>
+  </tr>
+</table>
 
 PnP infers range from *apparent size*, and the size is the weak link: the die is
 ~25 px across and its quad comes from a morphologically processed blob, so it
@@ -339,9 +395,17 @@ normals recover the die's full orientation, and a breadth-first search over the
 four primitives returns the shortest plan. Measured over all 24 orientations ×
 6 targets:
 
-| | already up | a lateral face | the bottom face |
-| --- | --- | --- | --- |
-| re-grasps | 0 | 1 | 2 |
+<table align="center">
+  <tr>
+    <th></th><th align="center">already up</th><th align="center">a lateral face</th><th align="center">the bottom face</th>
+  </tr>
+  <tr>
+    <td><strong>re-grasps</strong></td>
+    <td align="center">0</td>
+    <td align="center">1</td>
+    <td align="center">2</td>
+  </tr>
+</table>
 
 **Mean 1.0, hard cap of 2.**
 
@@ -364,10 +428,25 @@ uses on a real die, in three stages:
 Stages 2 and 3 issue the same instruction, so the implementation is short: probe
 once, deduce everything, then call the exact planner.
 
-| re-grasps | 0 | 1 | 2 | 3 |
-| --- | --- | --- | --- | --- |
-| cases (of 144) | 24 | 24 | 72 | 24 |
-| the target was… | on top | the probed side | the bottom, or on the grasp axis | opposite the probed side |
+<table align="center">
+  <tr>
+    <th>re-grasps</th><th align="center">0</th><th align="center">1</th><th align="center">2</th><th align="center">3</th>
+  </tr>
+  <tr>
+    <td><strong>cases (of 144)</strong></td>
+    <td align="center">24</td>
+    <td align="center">24</td>
+    <td align="center">72</td>
+    <td align="center">24</td>
+  </tr>
+  <tr>
+    <td><strong>the target was…</strong></td>
+    <td align="center">on top</td>
+    <td align="center">the probed side</td>
+    <td align="center">the bottom, or on the grasp axis</td>
+    <td align="center">opposite the probed side</td>
+  </tr>
+</table>
 
 **Mean 5/3 = 1.67, worst case 3.** It cannot be beaten without seeing more of the
 die: the four sides are indistinguishable until one is turned up, and any first
@@ -409,10 +488,26 @@ horizontal, and neither end is anywhere near the board.
 Replaying the exact pose from the failing run — die at `(-0.100, 0.650, 0.011)`,
 yaw 28.6°, `rotate +90deg about X`:
 
-| | approach after the flip | far end of the gripper body, at the place pose | retreat |
-| --- | --- | --- | --- |
-| `grasp_tilt_deg: 0` | `z = -0.000` — **horizontal** | `z = +0.015` — level with the board | nowhere: "back along the tool axis" is sideways |
-| `grasp_tilt_deg: 45` | `z = -0.707` | `z = +0.107` — 10 cm clear | lifts to `z = 0.086` |
+<table align="center">
+  <tr>
+    <th></th>
+    <th>approach after the flip</th>
+    <th>far end of the gripper body, at the place pose</th>
+    <th>retreat</th>
+  </tr>
+  <tr>
+    <td><code>grasp_tilt_deg: 0</code></td>
+    <td><code>z = -0.000</code> — <strong>horizontal</strong></td>
+    <td><code>z = +0.015</code> — level with the board</td>
+    <td>nowhere: "back along the tool axis" is sideways</td>
+  </tr>
+  <tr>
+    <td><code>grasp_tilt_deg: 45</code></td>
+    <td><code>z = -0.707</code></td>
+    <td><code>z = +0.107</code> — 10 cm clear</td>
+    <td>lifts to <code>z = 0.086</code></td>
+  </tr>
+</table>
 
 The board surface is at `z ≈ -0.002`. With no lean the gripper has to end up
 *inside* it; with the lean it has 10 cm of room.
@@ -436,11 +531,28 @@ That bit the obvious stand-off. Backing off 10 cm *along the tool axis* is the
 textbook pre-grasp — it slides the fingers on along their own length — but with
 a lean it moves sideways as well as up, and sideways is the expensive direction:
 
-| pre-grasp, same grasp pose | flange distance | of a UR5e's 850 mm |
-| --- | --- | --- |
-| 10 cm back along the tool axis | 0.847 m | **100 %** |
-| 10 cm straight up | 0.789 m | 93 % |
-| (the grasp itself) | 0.767 m | 90 % |
+<table align="center">
+  <tr>
+    <th>pre-grasp, same grasp pose</th>
+    <th align="right">flange distance</th>
+    <th align="right">of a UR5e's 850 mm</th>
+  </tr>
+  <tr>
+    <td>10 cm back along the tool axis</td>
+    <td align="right">0.847 m</td>
+    <td align="right"><strong>100 %</strong></td>
+  </tr>
+  <tr>
+    <td>10 cm straight up</td>
+    <td align="right">0.789 m</td>
+    <td align="right">93 %</td>
+  </tr>
+  <tr>
+    <td>(the grasp itself)</td>
+    <td align="right">0.767 m</td>
+    <td align="right">90 %</td>
+  </tr>
+</table>
 
 0.847 m is *nominally* inside the envelope and it still fails: at 99.6 %
 extension the elbow is straight and the arm is at a singularity. MoveIt reports
@@ -492,11 +604,28 @@ near-singular arm needs.
 
 How much choice there is depends on where the target face is, and it is lopsided:
 
-| target is… | shortest routes | alternatives at that length |
-| --- | --- | --- |
-| already up | 0 | — |
-| a **side** face | 1 turn | **none** — only one rotation brings a given side up |
-| the **bottom** face | 2 turns | 4 — any axis, either direction |
+<table align="center">
+  <tr>
+    <th>target is…</th>
+    <th align="center">shortest routes</th>
+    <th>alternatives at that length</th>
+  </tr>
+  <tr>
+    <td>already up</td>
+    <td align="center">0</td>
+    <td>—</td>
+  </tr>
+  <tr>
+    <td>a <strong>side</strong> face</td>
+    <td align="center">1 turn</td>
+    <td><strong>none</strong> — only one rotation brings a given side up</td>
+  </tr>
+  <tr>
+    <td>the <strong>bottom</strong> face</td>
+    <td align="center">2 turns</td>
+    <td>4 — any axis, either direction</td>
+  </tr>
+</table>
 
 The common case offers nothing, which is why the search may also take a route one
 turn *longer* than necessary once the free alternatives are exhausted
@@ -557,10 +686,23 @@ Why bother, when `move_to_pose` already works: **MoveIt plans every
 seven decelerations it does not need. Generating one trajectory across the whole
 path and sending it as a single `JointTrajectory` keeps the tool moving:
 
-| | duration | stops |
-| --- | --- | --- |
-| one `move_to_pose` per waypoint | 7.37 s | 8 |
-| blended, single trajectory | **5.61 s** | 4 |
+<table align="center">
+  <tr>
+    <th></th>
+    <th align="right">duration</th>
+    <th align="center">stops</th>
+  </tr>
+  <tr>
+    <td>one <code>move_to_pose</code> per waypoint</td>
+    <td align="right">7.37 s</td>
+    <td align="center">8</td>
+  </tr>
+  <tr>
+    <td>blended, single trajectory</td>
+    <td align="right"><strong>5.61 s</strong></td>
+    <td align="center">4</td>
+  </tr>
+</table>
 
 **−24 % on the cycle**, and cycle time is precisely what the challenge scores
 (*"max number of dice rolls in 10 min"*).

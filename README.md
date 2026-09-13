@@ -181,7 +181,9 @@ Each is rendered only while something is subscribed.
 
 #### Recording — the perception pipeline running live
 
-https://github.com/user-attachments/assets/5475ab0b-13d9-4061-bb03-9a3a752b28b3
+<p align="center">
+  <video src="https://github.com/user-attachments/assets/5475ab0b-13d9-4061-bb03-9a3a752b28b3" width="80%" controls muted loop></video>
+</p>
 
 `/dice_vision/mosaic` in RViz, all four stages updating together at 10 Hz while the
 die's colour is changed underneath the detector with `ros2 param set /fake_camera
